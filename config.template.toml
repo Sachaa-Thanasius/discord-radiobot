@@ -1,0 +1,13 @@
+[DISCORD]
+token = ""
+
+[DATABASE]
+path = "radio_data.db" # assumed default
+
+[LAVALINK]
+uri = "https://localhost:2333" # assumed default
+password = "youshallnotpass"   # assumed default
+
+[SPOTIFY] # optional: remove this section if you aren't expecting Spotify links
+client_id = ""
+client_secret = ""

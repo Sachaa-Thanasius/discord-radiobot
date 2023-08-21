@@ -1,0 +1,4 @@
+aiohttp>=3.8.5,<4
+apsw=>3.42.0.1,<4
+discord.py[voice]>=2.3.2,<3
+wavelink>=2.6.2,<3
