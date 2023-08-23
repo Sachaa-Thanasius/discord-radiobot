@@ -47,14 +47,16 @@ CREATE TABLE IF NOT EXISTS radio_stations (
 
 CREATE TABLE IF NOT EXISTS guild_radios (
     guild_id        INTEGER     NOT NULL        PRIMARY KEY,
-    station_id      INTEGER     NOT NULL        REFERENCES radio_stations(station_id) ON UPDATE CASCADE ON DELETE CASCADE,
+    station_id      INTEGER     NOT NULL,
     channel_id      INTEGER     NOT NULL,
-    always_shuffle  INTEGER     NOT NULL        DEFAULT TRUE
+    always_shuffle  INTEGER     NOT NULL        DEFAULT TRUE,
+    FOREIGN KEY     station_id  REFERENCES radio_stations(station_id) ON UPDATE CASCADE ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE IF NOT EXISTS guild_radio_dj_roles (
-    guild_id        INTEGER     NOT NULL        REFERENCES guild_radios(guild_id) ON UPDATE CASCADE ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS guild_managing_roles (
+    guild_id        INTEGER     NOT NULL,
     role_id         INTEGER     NOT NULL,
+    FOREIGN KEY     guild_id    REFERENCES guild_radios(guild_id) ON UPDATE CASCADE ON DELETE CASCADE,
     PRIMARY KEY     (guild_id, role_id)
 ) STRICT, WITHOUT ROWID;
 """
@@ -69,6 +71,31 @@ SELECT_ENABLED_GUILDS_STATEMENT = """
 SELECT guild_id FROM guild_radios;
 """
 
+SELECT_STATIONS_STATEMENTS = """
+SELECT * FROM radio_stations;
+"""
+
+SELECT_STATIONS_BY_NAME_STATEMENT = """
+SELECT * FROM radio_stations WHERE station_name = ?;
+"""
+
+SELECT_STATIONS_BY_OWNER_STATEMENT = """
+SELECT * FROM radio_stations WHERE owner_id = ?;
+"""
+
+SELECT_ROLES_BY_GUILD_STATEMENT = """
+SELECT role_id FROM guild_managing_roles WHERE guild_id = ?;
+"""
+
+UPSERT_STATION_STATEMENT = """
+INSERT INTO radio_stations(station_name, playlist_link, owner_id) VALUES (:station_name, :playlist_link, :owner_id)
+ON CONFLICT (station_name)
+DO UPDATE
+    SET playlist_link = excluded.playlist_link
+    WHERE owner_id = excluded.owner_id
+RETURNING *;
+"""
+
 UPSERT_GUILD_RADIO_STATEMENT = """
 INSERT INTO guild_radios(guild_id, channel_id, station_id, always_shuffle)
 VALUES (?, ?, ?, ?)
@@ -80,17 +107,8 @@ DO UPDATE
 RETURNING *;
 """
 
-INSERT_DJ_ROLE_STATEMENT = """
-INSERT INTO guild_radio_dj_roles (guild_id, role_id) VALUES (?, ?) ON CONFLICT DO NOTHING;
-"""
-
-UPSERT_STATION_STATEMENT = """
-INSERT INTO radio_stations(station_name, playlist_link, owner_id) VALUES (:station_name, :playlist_link, :owner_id)
-ON CONFLICT (station_name)
-DO UPDATE
-    SET playlist_link = excluded.playlist_link
-    WHERE owner_id = excluded.owner_id
-RETURNING *;
+INSERT_MANAGING_ROLE_STATEMENT = """
+INSERT INTO guild_managing_roles (guild_id, role_id) VALUES (?, ?) ON CONFLICT DO NOTHING;
 """
 
 
@@ -148,15 +166,6 @@ def _query_stations(
     return [StationInfo.from_row(row) for row in cursor.execute(query_str, params)]
 
 
-def _query_radios(
-    conn: apsw.Connection,
-    query_str: str,
-    params: tuple[int | str, ...] | None = None,
-) -> list[GuildRadioInfo]:
-    cursor = conn.cursor()
-    return [GuildRadioInfo.from_row(row) for row in cursor.execute(query_str, params)]
-
-
 def _get_all_guilds_radio_info(conn: apsw.Connection, guild_ids: list[tuple[int]]) -> list[GuildRadioInfo]:
     cursor = conn.cursor()
     return [GuildRadioInfo.from_row(row) for row in cursor.executemany(SELECT_ALL_INFO_BY_GUILD_STATEMENT, guild_ids)]
@@ -169,14 +178,14 @@ def _add_radio(
     channel_id: int,
     station_id: int,
     always_shuffle: bool,
-    managing_roles: list[discord.Role] | None = None,
+    managing_roles: list[discord.Role] | None,
 ) -> GuildRadioInfo | None:
     with conn:
         cursor = conn.cursor()
         cursor.execute(UPSERT_GUILD_RADIO_STATEMENT, (guild_id, channel_id, station_id, always_shuffle))
         guild_radio_record = GuildRadioInfo.from_row(record) if (record := cursor.fetchone()) else None
         if managing_roles:
-            cursor.executemany(INSERT_DJ_ROLE_STATEMENT, [(guild_id, role.id) for role in managing_roles])
+            cursor.executemany(INSERT_MANAGING_ROLE_STATEMENT, [(guild_id, role.id) for role in managing_roles])
         return guild_radio_record
 
 
@@ -299,7 +308,7 @@ class RadioBot(discord.AutoShardedClient):
         await wavelink.NodePool.connect(client=self, nodes=[node], spotify=sc)
 
         # Initialize the database and start the loop.
-        self._enabled_guilds: set[int] = await asyncio.to_thread(_setup_db, self.db_connection)
+        self.radio_enabled_guilds: set[int] = await asyncio.to_thread(_setup_db, self.db_connection)
         self.radio_loop.start()
 
     async def close(self: Self) -> None:
@@ -337,7 +346,7 @@ class RadioBot(discord.AutoShardedClient):
         """
 
         inactive_radio_guilds = [
-            guild for guild_id in self._enabled_guilds if (guild := self.get_guild(guild_id)) and not guild.voice_client
+            guild for guild_id in self.radio_enabled_guilds if (guild := self.get_guild(guild_id)) and not guild.voice_client
         ]
         radio_results = await asyncio.to_thread(
             _get_all_guilds_radio_info,
@@ -416,10 +425,11 @@ async def radio_set(
     managing_roles: str | None = None,
 ) -> None:
     assert itx.guild  # Known quantity since this is a guild-only command.
+
     station_records = await asyncio.to_thread(
         _query_stations,
         itx.client.db_connection,
-        """SELECT * FROM radio_stations WHERE station_name = ?;""",
+        SELECT_STATIONS_BY_NAME_STATEMENT,
         (station,),
     )
     if not station_records:
@@ -439,6 +449,7 @@ async def radio_set(
         always_shuffle=always_shuffle,
         managing_roles=roles,
     )
+    itx.client.radio_enabled_guilds.add(itx.guild.id)
 
     if record:
         content = f"Radio with station {record.station.station_name} set in <#{record.channel_id}>."
@@ -502,7 +513,7 @@ async def station_info(itx: discord.Interaction[RadioBot], station_name: str) ->
     records = await asyncio.to_thread(
         _query_stations,
         itx.client.db_connection,
-        """SELECT * FROM radio_stations WHERE station_name = ?;""",
+        SELECT_STATIONS_BY_NAME_STATEMENT,
         (station_name,),
     )
     if records and (stn := records[0]):
@@ -519,7 +530,7 @@ async def station_info(itx: discord.Interaction[RadioBot], station_name: str) ->
 @radio_get.autocomplete("station")
 @station_info.autocomplete("station")
 async def station_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
-    stations = await asyncio.to_thread(_query_stations, itx.client.db_connection, """SELECT * FROM radio_stations;""")
+    stations = await asyncio.to_thread(_query_stations, itx.client.db_connection, SELECT_STATIONS_STATEMENTS)
     return [
         app_commands.Choice(name=stn.station_name, value=stn.station_name)
         for stn in stations
@@ -532,7 +543,7 @@ async def station_edit_autocomplete(itx: discord.Interaction[RadioBot], current:
     stations = await asyncio.to_thread(
         _query_stations,
         itx.client.db_connection,
-        """SELECT * FROM radio_stations WHERE owner_id = ?;""",
+        SELECT_STATIONS_BY_OWNER_STATEMENT,
         (itx.user.id,),
     )
     return [
@@ -574,7 +585,7 @@ async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) 
             raw_results = await asyncio.to_thread(
                 _query,
                 itx.client.db_connection,
-                """SELECT row_id FROM guild_radio_dj_roles WHERE guild_id = ?;""",
+                SELECT_ROLES_BY_GUILD_STATEMENT,
                 (itx.guild.id,),
             )
             dj_role_ids = [result[1] for result in raw_results]
