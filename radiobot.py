@@ -10,13 +10,15 @@ import tomllib
 from collections.abc import AsyncIterable, Iterable
 from itertools import chain
 from pathlib import Path
-from typing import Self, TypeAlias
+from typing import Literal, Self, TypeAlias
+from urllib.parse import urlparse
 
 import apsw
 import attrs
 import discord
 import wavelink
 import yarl
+from apsw.ext import log_sqlite
 from discord import app_commands
 from discord.ext import tasks
 from wavelink.ext import spotify
@@ -34,35 +36,32 @@ with Path("config.toml").open("rb") as file_:
 
 INITIALIZATION_STATEMENTS = """
 PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = wal;
-PRAGMA synchronous = NORMAL;
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = normal;
 PRAGMA temp_store = memory;
-
 CREATE TABLE IF NOT EXISTS radio_stations (
-    station_id      INTEGER     PRIMARY KEY,
-    station_name    TEXT        NOT NULL,
+    station_id      INTEGER     NOT NULL        PRIMARY KEY,
+    station_name    TEXT        NOT NULL        UNIQUE,
     playlist_link   TEXT        NOT NULL,
     owner_id        INTEGER     NOT NULL
 ) STRICT;
-
 CREATE TABLE IF NOT EXISTS guild_radios (
     guild_id        INTEGER     NOT NULL        PRIMARY KEY,
     station_id      INTEGER     NOT NULL,
     channel_id      INTEGER     NOT NULL,
     always_shuffle  INTEGER     NOT NULL        DEFAULT TRUE,
-    FOREIGN KEY     station_id  REFERENCES radio_stations(station_id) ON UPDATE CASCADE ON DELETE CASCADE
+    FOREIGN KEY     (station_id)  REFERENCES radio_stations(station_id) ON UPDATE CASCADE ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
-
 CREATE TABLE IF NOT EXISTS guild_managing_roles (
     guild_id        INTEGER     NOT NULL,
     role_id         INTEGER     NOT NULL,
-    FOREIGN KEY     guild_id    REFERENCES guild_radios(guild_id) ON UPDATE CASCADE ON DELETE CASCADE,
+    FOREIGN KEY     (guild_id)    REFERENCES guild_radios(guild_id) ON UPDATE CASCADE ON DELETE CASCADE,
     PRIMARY KEY     (guild_id, role_id)
 ) STRICT, WITHOUT ROWID;
 """
 
 SELECT_ALL_INFO_BY_GUILD_STATEMENT = """
-SELECT guild_id, channel_id, always_shuffle, station_id, station_name, playlist_link
+SELECT guild_id, channel_id, always_shuffle, station_id, station_name, playlist_link, owner_id
 FROM guild_radios INNER JOIN radio_stations USING (station_id)
 WHERE guild_id = ?;
 """
@@ -103,8 +102,7 @@ ON CONFLICT (guild_id)
 DO UPDATE
     SET channel_id = EXCLUDED.channel_id,
         station_id = EXCLUDED.station_id,
-        always_shuffle = EXCLUDED.always_shuffle
-RETURNING *;
+        always_shuffle = EXCLUDED.always_shuffle;
 """
 
 INSERT_MANAGING_ROLE_STATEMENT = """
@@ -135,6 +133,7 @@ class GuildRadioInfo:
 
     @classmethod
     def from_row(cls: type[Self], row: GuildRadioInfoTuple) -> Self:
+        print(row)
         guild_id, channel_id, always_shuffle, station_id, station_name, playlist_link, owner_id = row
         return cls(
             guild_id,
@@ -145,11 +144,12 @@ class GuildRadioInfo:
 
 
 def _setup_db(conn: apsw.Connection) -> set[int]:
-    with conn:
-        cursor = conn.cursor()
-        cursor.execute(INITIALIZATION_STATEMENTS)
-        cursor.execute(SELECT_ENABLED_GUILDS_STATEMENT)
-        return set(chain.from_iterable(cursor))
+    # with conn:
+    cursor = conn.cursor()
+    cursor.execute(INITIALIZATION_STATEMENTS)
+    print("thing", list(cursor))  # This shouldn't have anything.
+    cursor.execute(SELECT_ENABLED_GUILDS_STATEMENT)
+    return set(chain.from_iterable(cursor))
 
 
 def _query(conn: apsw.Connection, query_str: str, params: tuple[int | str, ...]) -> list[tuple[apsw.SQLiteValue, ...]]:
@@ -183,10 +183,10 @@ def _add_radio(
     with conn:
         cursor = conn.cursor()
         cursor.execute(UPSERT_GUILD_RADIO_STATEMENT, (guild_id, channel_id, station_id, always_shuffle))
-        guild_radio_record = GuildRadioInfo.from_row(record) if (record := cursor.fetchone()) else None
         if managing_roles:
             cursor.executemany(INSERT_MANAGING_ROLE_STATEMENT, [(guild_id, role.id) for role in managing_roles])
-        return guild_radio_record
+        record = cursor.execute(SELECT_ALL_INFO_BY_GUILD_STATEMENT, (guild_id,))
+        return GuildRadioInfo.from_row(rec) if (rec := record.fetchone()) else None
 
 
 class WavelinkTrackConverter:
@@ -204,6 +204,7 @@ class WavelinkTrackConverter:
         """Get the searchable wavelink class that matches the argument string closest."""
 
         check = yarl.URL(argument)
+        print(check.parts, "\n", urlparse(argument))
 
         if (
             (not check.host and not check.scheme)
@@ -278,6 +279,12 @@ async def format_track_embed(embed: discord.Embed, track: wavelink.Playable | sp
     return embed
 
 
+def convert_list_role(roles_input_str: str, guild: discord.Guild) -> list[discord.Role]:
+    split_role_ids_pattern = re.compile(r"(?:<@&|.*?)([0-9]{15,20})(?:>|.*?)")
+    matches = split_role_ids_pattern.findall(roles_input_str)
+    return [role for match in matches if (role := guild.get_role(int(match)))] if matches else []
+
+
 class RadioBot(discord.AutoShardedClient):
     def __init__(self: Self) -> None:
         super().__init__(
@@ -288,7 +295,7 @@ class RadioBot(discord.AutoShardedClient):
 
         # Connect to the database that will store the radio information.
         db_path = Path(config["DATABASE"]["path"])
-        resolved_path_as_str = str(db_path.resolve(strict=True))
+        resolved_path_as_str = str(db_path.resolve())
         self.db_connection = apsw.Connection(resolved_path_as_str)
 
     async def on_connect(self: Self) -> None:
@@ -299,9 +306,6 @@ class RadioBot(discord.AutoShardedClient):
         self.invite_link = discord.utils.oauth_url(data.id, permissions=perms)
 
     async def setup_hook(self: Self) -> None:
-        # Sync commands. Maybe remove later.
-        await self.tree.sync()
-
         # Connect to the Lavalink node that will provide the music.
         node = wavelink.Node(**config["LAVALINK"])
         sc = spotify.SpotifyClient(**config["SPOTIFY"]) if ("SPOTIFY" in config) else None
@@ -346,7 +350,9 @@ class RadioBot(discord.AutoShardedClient):
         """
 
         inactive_radio_guilds = [
-            guild for guild_id in self.radio_enabled_guilds if (guild := self.get_guild(guild_id)) and not guild.voice_client
+            guild
+            for guild_id in self.radio_enabled_guilds
+            if (guild := self.get_guild(guild_id)) and not guild.voice_client
         ]
         radio_results = await asyncio.to_thread(
             _get_all_guilds_radio_info,
@@ -362,12 +368,6 @@ class RadioBot(discord.AutoShardedClient):
 
 
 bot = RadioBot()
-
-
-def convert_list_role(roles_input_str: str, guild: discord.Guild) -> list[discord.Role]:
-    split_role_ids_pattern = re.compile(r"(?:<@&|.*?)([0-9]{15,20})(?:>|.*?)")
-    matches = split_role_ids_pattern.findall(roles_input_str)
-    return [role for match in matches if (role := guild.get_role(int(match)))] if matches else []
 
 
 ########################
@@ -468,7 +468,7 @@ async def radio_get(itx: discord.Interaction[RadioBot]) -> None:
         [(itx.guild_id,)],
     )
 
-    if local_radio := local_radio_results[0]:
+    if local_radio_results and (local_radio := local_radio_results[0]):
         station = local_radio.station
         embed = (
             discord.Embed(title="Current Guild's Radio")
@@ -527,8 +527,8 @@ async def station_info(itx: discord.Interaction[RadioBot], station_name: str) ->
         await itx.response.send_message("No such station found.")
 
 
-@radio_get.autocomplete("station")
-@station_info.autocomplete("station")
+@radio_set.autocomplete("station")
+@station_info.autocomplete("station_name")
 async def station_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
     stations = await asyncio.to_thread(_query_stations, itx.client.db_connection, SELECT_STATIONS_STATEMENTS)
     return [
@@ -538,8 +538,8 @@ async def station_autocomplete(itx: discord.Interaction[RadioBot], current: str)
     ]
 
 
-@station_set.autocomplete("station")
-async def station_edit_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
+@station_set.autocomplete("station_name")
+async def station_set_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
     stations = await asyncio.to_thread(
         _query_stations,
         itx.client.db_connection,
@@ -558,13 +558,16 @@ bot.tree.add_command(station_group)
 
 @bot.tree.command(description="See what's currently playing on the radio.")
 @app_commands.guild_only()
-async def current(itx: discord.Interaction[RadioBot]) -> None:
+async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "station", "radio"] = "track") -> None:
     assert itx.guild  # Known quantity in guild-only command.
 
     vc: wavelink.Player | None = itx.guild.voice_client  # type: ignore
-    if vc and vc.current:
-        embed = await format_track_embed(discord.Embed(color=0x0389DA, title="Currently Playing"), vc.current)
-        await itx.response.send_message(embed=embed, ephemeral=True)
+    if vc:
+        if level == "track" and vc.current:
+            embed = await format_track_embed(discord.Embed(color=0x0389DA, title="Currently Playing"), vc.current)
+            await itx.response.send_message(embed=embed, ephemeral=True)
+        elif level == "station":
+            pass
     else:
         await itx.response.send_message("No radio currently active in this server.")
 
@@ -588,9 +591,9 @@ async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) 
                 SELECT_ROLES_BY_GUILD_STATEMENT,
                 (itx.guild.id,),
             )
-            dj_role_ids = [result[1] for result in raw_results]
+            dj_role_ids = [result[1] for result in raw_results] if raw_results else None
 
-            if any((role.id in dj_role_ids) for role in itx.user.roles):
+            if (not dj_role_ids) or any((role.id in dj_role_ids) for role in itx.user.roles):
                 await vc.set_volume(volume)
                 await itx.response.send_message(f"Volume now changed to {vc.volume}.")
             else:
@@ -607,9 +610,10 @@ async def invite(itx: discord.Interaction[RadioBot]) -> None:
 
 
 def main() -> None:
+    log_sqlite()
     token: str = config["DISCORD"]["token"]
     bot.run(token)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
