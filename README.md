@@ -2,7 +2,7 @@
     discord-radiobot
     <br>
     <sub>
-        <img src=".github/assets/logo.png" height="150">
+        <img src=".github/assets/logo.png" height="300">
     </sub>
 </h1>
 
