@@ -48,6 +48,8 @@ ignore = [
     "PLR2004", # Magic value comparison, may remove later
     "SIM105",  # supressable exception, I'm not paying the overhead of contextlib.supress for stylistic choices.
     "C90",     # mccabe complexity memes
+    "PLR0913", # More than 5 arguments isn't a problem here.
+    "ANN401",  # Need to type-hint *args and **kwargs with Any
 ]
 unfixable = [
     "ERA", # I don't want anything erroneously detected deleted by this.

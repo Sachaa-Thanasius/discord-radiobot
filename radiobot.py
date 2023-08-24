@@ -7,10 +7,10 @@ import datetime
 import logging
 import re
 import tomllib
-from collections.abc import AsyncIterable, Iterable
+from collections.abc import AsyncIterator, Iterable
 from itertools import chain
 from pathlib import Path
-from typing import Literal, Self, TypeAlias
+from typing import Any, Literal, Self, TypeAlias, cast
 from urllib.parse import urlparse
 
 import apsw
@@ -27,7 +27,7 @@ from wavelink.ext import spotify
 GuildRadioInfoTuple: TypeAlias = tuple[int, int, bool, int, str, str, int]
 RadioStationTuple: TypeAlias = tuple[int, str, str, int]
 AnyTrack: TypeAlias = wavelink.Playable | spotify.SpotifyTrack
-AnyTrackIterable: TypeAlias = list[wavelink.Playable] | list[spotify.SpotifyTrack] | AsyncIterable[spotify.SpotifyTrack]
+AnyTrackIterable: TypeAlias = list[wavelink.Playable] | list[spotify.SpotifyTrack] | spotify.SpotifyAsyncIterator
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +122,13 @@ class StationInfo:
         station_id, station_name, playlist_link, owner_id = row
         return cls(station_id, station_name, playlist_link, owner_id)
 
+    def display_embed(self: Self) -> discord.Embed:
+        return (
+            discord.Embed(title=f"Station {self.station_id}: {self.station_name}")
+            .add_field(name="Source", value=f"[Here]({self.playlist_link})")
+            .add_field(name="Owner", value=f"<@{self.owner_id}>")
+        )
+
 
 @attrs.define
 class GuildRadioInfo:
@@ -133,7 +140,6 @@ class GuildRadioInfo:
 
     @classmethod
     def from_row(cls: type[Self], row: GuildRadioInfoTuple) -> Self:
-        print(row)
         guild_id, channel_id, always_shuffle, station_id, station_name, playlist_link, owner_id = row
         return cls(
             guild_id,
@@ -142,12 +148,20 @@ class GuildRadioInfo:
             StationInfo(station_id, station_name, playlist_link, owner_id),
         )
 
+    def display_embed(self: Self) -> discord.Embed:
+        return (
+            discord.Embed(title="Current Guild's Radio")
+            .add_field(name="Channel", value=f"<#{self.channel_id}>")
+            .add_field(name=f"Station: {self.station.station_name}", value=f"[Source]({self.station.playlist_link})")
+            .add_field(name="Always Shuffle", value=("Yes" if self.always_shuffle else "No"))
+        )
+
 
 def _setup_db(conn: apsw.Connection) -> set[int]:
     # with conn:
     cursor = conn.cursor()
     cursor.execute(INITIALIZATION_STATEMENTS)
-    print("thing", list(cursor))  # This shouldn't have anything.
+    cursor.fetchall()  # To get rid of the ("wal",) that's returned for some reason.
     cursor.execute(SELECT_ENABLED_GUILDS_STATEMENT)
     return set(chain.from_iterable(cursor))
 
@@ -204,7 +218,8 @@ class WavelinkTrackConverter:
         """Get the searchable wavelink class that matches the argument string closest."""
 
         check = yarl.URL(argument)
-        print(check.parts, "\n", urlparse(argument))
+        print("yarl: ", check.scheme, check.host, check.parts)
+        print("urllib: ", "\n", urlparse(argument))
 
         if (
             (not check.host and not check.scheme)
@@ -236,7 +251,7 @@ class WavelinkTrackConverter:
         search_type = cls._get_search_type(argument)
         if issubclass(search_type, spotify.SpotifyTrack):
             try:
-                tracks = (track async for track in search_type.iterator(query=argument))  # type: ignore # wl typing
+                tracks = search_type.iterator(query=argument)
             except TypeError:
                 tracks = await search_type.search(argument)
         else:
@@ -285,6 +300,16 @@ def convert_list_role(roles_input_str: str, guild: discord.Guild) -> list[discor
     return [role for match in matches if (role := guild.get_role(int(match)))] if matches else []
 
 
+class RadioPlayer(wavelink.Player):
+    def __init__(self: Self, *args: Any, radio_info: GuildRadioInfo, **kwargs: Any) -> None:
+        self.radio_info = radio_info
+        super().__init__(*args, *kwargs)
+
+    @property
+    def station_info(self: Self) -> StationInfo:
+        return self.radio_info.station
+
+
 class RadioBot(discord.AutoShardedClient):
     def __init__(self: Self) -> None:
         super().__init__(
@@ -295,7 +320,7 @@ class RadioBot(discord.AutoShardedClient):
 
         # Connect to the database that will store the radio information.
         db_path = Path(config["DATABASE"]["path"])
-        resolved_path_as_str = str(db_path.resolve())
+        resolved_path_as_str = str(db_path.resolve())  # Need to account for file not existing.
         self.db_connection = apsw.Connection(resolved_path_as_str)
 
     async def on_connect(self: Self) -> None:
@@ -321,22 +346,24 @@ class RadioBot(discord.AutoShardedClient):
 
     async def start_guild_radio(self: Self, radio_info: GuildRadioInfo) -> None:
         # Initialize the guild's specific radio voice client.
-        guild: discord.Guild = self.get_guild(radio_info.guild_id)  # type: ignore # Known during runtime.
+        guild: discord.Guild = self.get_guild(radio_info.guild_id)  # type: ignore # Known at runtime.
         voice_channel: discord.abc.Connectable = guild.get_channel(radio_info.channel_id)  # type: ignore # Known
-        vc = await voice_channel.connect(cls=wavelink.Player)  # type: ignore # Valid class.
+        player = RadioPlayer(radio_info=radio_info)
+        vc = await voice_channel.connect(cls=player)  # type: ignore # Should be valid Player instance.
 
         # Get the playlist of the guild's registered radio station and play it on loop.
         converted = await WavelinkTrackConverter.convert(radio_info.station.playlist_link)
         if isinstance(converted, Iterable):
             for sub_item in converted:
                 await vc.queue.put_wait(sub_item)
-        elif isinstance(converted, AsyncIterable):
-            async for sub_item in converted:
+        elif isinstance(converted, spotify.SpotifyAsyncIterator):
+            # Awkward casting to satisfy pyright since wavelink isn't fully typed.
+            async for sub_item in cast(AsyncIterator[spotify.SpotifyTrack], converted):
                 await vc.queue.put_wait(sub_item)
         else:
             await vc.queue.put_wait(converted)
 
-        vc.queue.loop_all = True
+        vc.queue.loop_all = True    # TODO: Figure out why it doesn't loop.
         if radio_info.always_shuffle:
             vc.queue.shuffle()
 
@@ -391,6 +418,7 @@ async def on_wavelink_track_end(payload: wavelink.TrackEventPayload) -> None:
 
     if player.is_connected():
         next_track = await player.queue.get_wait()
+        log.info("Next track: %r", next_track)
         await player.play(next_track)
     else:
         await player.stop()
@@ -424,7 +452,7 @@ async def radio_set(
     always_shuffle: bool = True,
     managing_roles: str | None = None,
 ) -> None:
-    assert itx.guild  # Known quantity since this is a guild-only command.
+    assert itx.guild  # Known quantity in guild-only command.
 
     station_records = await asyncio.to_thread(
         _query_stations,
@@ -458,9 +486,12 @@ async def radio_set(
     await itx.response.send_message(content)
 
 
-@radio_group.command(name="get", description="Get information about your server's current radio setup.")
+@radio_group.command(
+    name="get",
+    description="Get information about your server's current radio setup. May need /restart to be up to date.",
+)
 async def radio_get(itx: discord.Interaction[RadioBot]) -> None:
-    assert itx.guild_id  # Known quantity since this is a guild-only command.
+    assert itx.guild_id  # Known quantity in guild-only command.
 
     local_radio_results = await asyncio.to_thread(
         _get_all_guilds_radio_info,
@@ -469,14 +500,30 @@ async def radio_get(itx: discord.Interaction[RadioBot]) -> None:
     )
 
     if local_radio_results and (local_radio := local_radio_results[0]):
-        station = local_radio.station
-        embed = (
-            discord.Embed(title="Current Guild's Radio")
-            .add_field(name="Channel", value=f"<#{local_radio.channel_id}>")
-            .add_field(name=f"Station: {station.station_name}", value=f"[Source]({station.playlist_link})")
-            .add_field(name="Always Shuffle", value=("Yes" if local_radio.always_shuffle else "No"))
-        )
-        await itx.response.send_message(embed=embed)
+        await itx.response.send_message(embed=local_radio.display_embed())
+    else:
+        await itx.response.send_message("No radio found for this guild.")
+
+
+@radio_group.command(
+    name="restart",
+    description="Restart your server's radio. Acts as a reset in case you change something.",
+)
+async def radio_restart(itx: discord.Interaction[RadioBot]) -> None:
+    assert itx.guild  # Known quantity in guild-only command.
+
+    if vc := itx.guild.voice_client:
+        await vc.disconnect(force=True)
+
+    guild_radio_records = await asyncio.to_thread(
+        _get_all_guilds_radio_info,
+        itx.client.db_connection,
+        [(itx.guild.id,)],
+    )
+
+    if guild_radio_records and (record := guild_radio_records[0]):
+        await itx.client.start_guild_radio(record)
+        await itx.response.send_message("Restarting radio now...")
     else:
         await itx.response.send_message("No radio found for this guild.")
 
@@ -516,13 +563,8 @@ async def station_info(itx: discord.Interaction[RadioBot], station_name: str) ->
         SELECT_STATIONS_BY_NAME_STATEMENT,
         (station_name,),
     )
-    if records and (stn := records[0]):
-        embed = (
-            discord.Embed(title=f"Station {stn.station_id}: {stn.station_name}")
-            .add_field(name="Source", value=f"[Here]({stn.playlist_link})")
-            .add_field(name="Owner", value=f"<@{stn.owner_id}>")
-        )
-        await itx.response.send_message(embed=embed, ephemeral=True)
+    if records and (station := records[0]):
+        await itx.response.send_message(embed=station.display_embed(), ephemeral=True)
     else:
         await itx.response.send_message("No such station found.")
 
@@ -530,6 +572,8 @@ async def station_info(itx: discord.Interaction[RadioBot], station_name: str) ->
 @radio_set.autocomplete("station")
 @station_info.autocomplete("station_name")
 async def station_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
+    """Autocomplete callback for all existing stations."""
+
     stations = await asyncio.to_thread(_query_stations, itx.client.db_connection, SELECT_STATIONS_STATEMENTS)
     return [
         app_commands.Choice(name=stn.station_name, value=stn.station_name)
@@ -540,12 +584,15 @@ async def station_autocomplete(itx: discord.Interaction[RadioBot], current: str)
 
 @station_set.autocomplete("station_name")
 async def station_set_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
+    """Autocomplete callback for stations created by the user."""
+
     stations = await asyncio.to_thread(
         _query_stations,
         itx.client.db_connection,
         SELECT_STATIONS_BY_OWNER_STATEMENT,
         (itx.user.id,),
     )
+
     return [
         app_commands.Choice(name=stn.station_name, value=stn.station_name)
         for stn in stations
@@ -561,13 +608,15 @@ bot.tree.add_command(station_group)
 async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "station", "radio"] = "track") -> None:
     assert itx.guild  # Known quantity in guild-only command.
 
-    vc: wavelink.Player | None = itx.guild.voice_client  # type: ignore
+    vc: RadioPlayer | None = itx.guild.voice_client  # type: ignore # Known at runtime.
     if vc:
         if level == "track" and vc.current:
             embed = await format_track_embed(discord.Embed(color=0x0389DA, title="Currently Playing"), vc.current)
             await itx.response.send_message(embed=embed, ephemeral=True)
         elif level == "station":
-            pass
+            embed = vc.station_info.display_embed()
+        else:
+            embed = vc.radio_info.display_embed()
     else:
         await itx.response.send_message("No radio currently active in this server.")
 
@@ -579,7 +628,7 @@ async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) 
     assert itx.guild
     assert isinstance(itx.user, discord.Member)
 
-    vc: wavelink.Player | None = itx.guild.voice_client  # type: ignore
+    vc: RadioPlayer | None = itx.guild.voice_client  # type: ignore # Known at runtime
 
     if vc:
         if volume is None:
