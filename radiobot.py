@@ -20,7 +20,7 @@ import wavelink
 import yarl
 from apsw.ext import log_sqlite
 from discord import app_commands
-from discord.ext import tasks
+from discord.ext import commands, tasks
 from wavelink.ext import spotify
 
 
@@ -46,16 +46,16 @@ CREATE TABLE IF NOT EXISTS radio_stations (
     owner_id        INTEGER     NOT NULL
 ) STRICT;
 CREATE TABLE IF NOT EXISTS guild_radios (
-    guild_id        INTEGER     NOT NULL        PRIMARY KEY,
-    station_id      INTEGER     NOT NULL,
-    channel_id      INTEGER     NOT NULL,
-    always_shuffle  INTEGER     NOT NULL        DEFAULT TRUE,
-    FOREIGN KEY     (station_id)  REFERENCES radio_stations(station_id) ON UPDATE CASCADE ON DELETE CASCADE
+    guild_id        INTEGER         NOT NULL        PRIMARY KEY,
+    station_id      INTEGER         NOT NULL,
+    channel_id      INTEGER         NOT NULL,
+    always_shuffle  INTEGER         NOT NULL        DEFAULT TRUE,
+    FOREIGN KEY     (station_id)    REFERENCES radio_stations(station_id) ON UPDATE CASCADE ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS guild_managing_roles (
     guild_id        INTEGER     NOT NULL,
     role_id         INTEGER     NOT NULL,
-    FOREIGN KEY     (guild_id)    REFERENCES guild_radios(guild_id) ON UPDATE CASCADE ON DELETE CASCADE,
+    FOREIGN KEY     (guild_id)  REFERENCES guild_radios(guild_id) ON UPDATE CASCADE ON DELETE CASCADE,
     PRIMARY KEY     (guild_id, role_id)
 ) STRICT, WITHOUT ROWID;
 """
@@ -87,7 +87,7 @@ SELECT role_id FROM guild_managing_roles WHERE guild_id = ?;
 """
 
 UPSERT_STATION_STATEMENT = """
-INSERT INTO radio_stations(station_name, playlist_link, owner_id) VALUES (:station_name, :playlist_link, :owner_id)
+INSERT INTO radio_stations(station_name, playlist_link, owner_id) VALUES (?, ?, ?)
 ON CONFLICT (station_name)
 DO UPDATE
     SET playlist_link = excluded.playlist_link
@@ -310,13 +310,15 @@ class RadioPlayer(wavelink.Player):
         return self.radio_info.station
 
 
-class RadioBot(discord.AutoShardedClient):
+class RadioBot(commands.AutoShardedBot):
     def __init__(self: Self) -> None:
+        # TODO: Convert back to AutoShardedClient later.
         super().__init__(
+            command_prefix=commands.when_mentioned,
             intents=discord.Intents.default(),  # Can be reduced later.
             activity=discord.Game(name="https://github.com/Sachaa-Thanasius/discord-radiobot"),
         )
-        self.tree = app_commands.CommandTree(self)
+        # self.tree = app_commands.CommandTree(self)
 
         # Connect to the database that will store the radio information.
         db_path = Path(config["DATABASE"]["path"])
@@ -363,7 +365,7 @@ class RadioBot(discord.AutoShardedClient):
         else:
             await vc.queue.put_wait(converted)
 
-        vc.queue.loop_all = True    # TODO: Figure out why it doesn't loop.
+        vc.queue.loop_all = True  # TODO: Figure out why it doesn't loop.
         if radio_info.always_shuffle:
             vc.queue.shuffle()
 
@@ -397,9 +399,9 @@ class RadioBot(discord.AutoShardedClient):
 bot = RadioBot()
 
 
-########################
-### Wavelink listeners
-########################
+##################################
+### Discord and Wavelink listeners
+##################################
 @bot.event
 async def on_wavelink_node_ready(node: wavelink.Node) -> None:
     """Called when the Node you are connecting to has initialised and successfully connected to Lavalink."""
@@ -612,11 +614,11 @@ async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "s
     if vc:
         if level == "track" and vc.current:
             embed = await format_track_embed(discord.Embed(color=0x0389DA, title="Currently Playing"), vc.current)
-            await itx.response.send_message(embed=embed, ephemeral=True)
         elif level == "station":
             embed = vc.station_info.display_embed()
         else:
             embed = vc.radio_info.display_embed()
+        await itx.response.send_message(embed=embed, ephemeral=True)
     else:
         await itx.response.send_message("No radio currently active in this server.")
 
@@ -656,6 +658,43 @@ async def invite(itx: discord.Interaction[RadioBot]) -> None:
     embed = discord.Embed(description="Click the link below to invite me to one of your servers.")
     view = discord.ui.View().add_item(discord.ui.Button(label="Invite", url=itx.client.invite_link))
     await itx.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+@bot.tree.command(description="Basic instructions for setting up your radio.")
+async def setup_help(itx: discord.Interaction[RadioBot]) -> None:
+    description = (
+        "1. If you want a custom radio station, create one with a specific song/playlist link via `/station set`.\n"
+        "2. Create the radio for your server with /radio set, using the name of a preexisting station or one you must "
+        "made.\n"
+        "3. The bot should join the channel specified in Step 2 and begin playing shortly!"
+    )
+    embed = discord.Embed(description=description)
+    await itx.response.send_message(embed=embed)
+
+
+#######################################
+### Dev stuff - To be removed later.
+#######################################
+@bot.tree.error
+async def on_app_command_error(itx: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    log.exception("App command error", exc_info=error)
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context[RadioBot], error: commands.CommandError) -> None:
+    log.exception("Regular command error", exc_info=error)
+
+
+@bot.command()
+async def shutdown(ctx: commands.Context[RadioBot]) -> None:
+    await ctx.send("Shutting down bot...")
+    await bot.close()
+
+
+@bot.command("sync")
+async def sync_(ctx: commands.Context[RadioBot]) -> None:
+    await ctx.send("Syncing app commands...")
+    await bot.tree.sync()
 
 
 def main() -> None:
