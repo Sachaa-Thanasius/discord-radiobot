@@ -1,4 +1,5 @@
 """Heavily inspired by @mikeshardmind's one-file bots, which may explain if this looks familiar."""
+# TODO: Have a better way to check for DJ roles.
 
 from __future__ import annotations
 
@@ -257,10 +258,10 @@ class WavelinkTrackConverter:
             raise wavelink.NoTracksError(msg)
 
         # Still possible for tracks to be a Playlist subclass at this point.
-        if issubclass(search_type, wavelink.Playable) and isinstance(tracks, list):  # type: ignore # wl typing
+        if issubclass(search_type, wavelink.Playable) and isinstance(tracks, list):
             tracks = tracks[0]
 
-        return tracks  # type: ignore # wl spotify iterator typing
+        return tracks
 
 
 async def format_track_embed(embed: discord.Embed, track: wavelink.Playable | spotify.SpotifyTrack) -> discord.Embed:
@@ -289,158 +290,19 @@ async def format_track_embed(embed: discord.Embed, track: wavelink.Playable | sp
     return embed
 
 
-def convert_list_role(roles_input_str: str, guild: discord.Guild) -> list[discord.Role]:
+def convert_list_to_roles(roles_input_str: str, guild: discord.Guild) -> list[discord.Role]:
     split_role_ids_pattern = re.compile(r"(?:<@&|.*?)([0-9]{15,20})(?:>|.*?)")
     matches = split_role_ids_pattern.findall(roles_input_str)
     return [role for match in matches if (role := guild.get_role(int(match)))] if matches else []
 
 
-class RadioPlayer(wavelink.Player):
-    def __init__(self: Self, *args: Any, radio_info: GuildRadioInfo, **kwargs: Any) -> None:
-        self.radio_info = radio_info
-        super().__init__(*args, *kwargs)
-
-    @property
-    def station_info(self: Self) -> StationInfo:
-        return self.radio_info.station
-
-
-class RadioBot(commands.AutoShardedBot):
-    config: dict[str, Any]
-
-    def __init__(self: Self) -> None:
-        # TODO: Convert back to AutoShardedClient later.
-
-        super().__init__(
-            command_prefix=commands.when_mentioned,
-            intents=discord.Intents.default(),  # Can be reduced later.
-            activity=discord.Game(name="https://github.com/Sachaa-Thanasius/discord-radiobot"),
-        )
-        # self.tree = app_commands.CommandTree(self)
-
-        # Connect to the database that will store the radio information.
-        db_path = Path(self.config["DATABASE"]["path"])
-        resolved_path_as_str = str(db_path.resolve())  # Need to account for file not existing.
-        self.db_connection = apsw.Connection(resolved_path_as_str)
-
-    async def on_connect(self: Self) -> None:
-        # Create an invite link.
-        await self.wait_until_ready()
-        data = await self.application_info()
-        perms = discord.Permissions(274881367040)
-        self.invite_link = discord.utils.oauth_url(data.id, permissions=perms)
-
-    async def setup_hook(self: Self) -> None:
-        # Connect to the Lavalink node that will provide the music.
-        node = wavelink.Node(**self.config["LAVALINK"])
-        sc = spotify.SpotifyClient(**self.config["SPOTIFY"]) if ("SPOTIFY" in self.config) else None
-        await wavelink.NodePool.connect(client=self, nodes=[node], spotify=sc)
-
-        # Initialize the database and start the loop.
-        self.radio_enabled_guilds: set[int] = await asyncio.to_thread(_setup_db, self.db_connection)
-        self.radio_loop.start()
-
-        # await self.tree.sync()    # In production, this should run rarely, so it's fine to automate it.
-
-    async def close(self: Self) -> None:
-        self.radio_loop.cancel()
-        return await super().close()
-
-    async def start_guild_radio(self: Self, radio_info: GuildRadioInfo) -> None:
-        # Initialize the guild's specific radio voice client.
-        guild = self.get_guild(radio_info.guild_id)
-        if not guild:  # Technically possible if a guild is deleted?
-            return
-
-        voice_channel: discord.abc.Connectable = guild.get_channel(radio_info.channel_id)  # type: ignore # Known
-        player = RadioPlayer(radio_info=radio_info)
-        vc = await voice_channel.connect(cls=player)  # type: ignore # Should be valid Player instance.
-
-        # Get the playlist of the guild's registered radio station and play it on loop.
-        converted = await WavelinkTrackConverter.convert(radio_info.station.playlist_link)
-        if isinstance(converted, Iterable):
-            for sub_item in converted:
-                await vc.queue.put_wait(sub_item)
-        elif isinstance(converted, spotify.SpotifyAsyncIterator):
-            # Awkward casting to satisfy pyright since wavelink isn't fully typed.
-            async for sub_item in cast(AsyncIterator[spotify.SpotifyTrack], converted):
-                await vc.queue.put_wait(sub_item)
-        else:
-            await vc.queue.put_wait(converted)
-
-        vc.queue.loop_all = True
-        if radio_info.always_shuffle:
-            vc.queue.shuffle()
-
-        await vc.play(vc.queue.get())
-
-    @tasks.loop(seconds=10.0)
-    async def radio_loop(self: Self) -> None:
-        """The main loop for the radios.
-
-        It (re)connects voice clients to voice channels and plays preset stations.
-        """
-
-        inactive_radio_guilds = [
-            guild
-            for guild_id in self.radio_enabled_guilds
-            if (guild := self.get_guild(guild_id)) and not guild.voice_client
-        ]
-        radio_results = await asyncio.to_thread(
-            _get_all_guilds_radio_info,
-            self.db_connection,
-            [(guild.id,) for guild in inactive_radio_guilds],
-        )
-        async with asyncio.TaskGroup() as tg:
-            for radio in radio_results:
-                tg.create_task(self.start_guild_radio(radio))
-
-    @radio_loop.before_loop
-    async def radio_loop_before(self: Self) -> None:
-        await self.wait_until_ready()
-
-
-bot = RadioBot()
-
-
-######################
-### Wavelink listeners
-######################
-@bot.event
-async def on_wavelink_node_ready(node: wavelink.Node) -> None:
-    """Called when the Node you are connecting to has initialised and successfully connected to Lavalink."""
-
-    log.info("Wavelink node %s is ready!", node.id)
-
-
-@bot.event
-async def on_wavelink_track_end(payload: wavelink.TrackEventPayload) -> None:
-    """Called when the current track has finished playing.
-
-    Plays the next track in the queue so long as the player hasn't disconnected.
-    """
-
-    player = payload.player
-
-    if player.is_connected():
-        next_track = player.queue.get()
-        await player.play(next_track)
-        # TODO: Make sure to shuffle the queue if it's set to always shuffle.
-    else:
-        await player.stop()
-
-
 ########################
 ### Application commands
 ########################
-
-
-# @radio_set.autocomplete("station")
-# @station_info.autocomplete("station_name")
 async def station_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
     """Autocomplete callback for all existing stations."""
 
-    stations = await asyncio.to_thread(_query_stations, itx.client.db_connection, SELECT_STATIONS_STATEMENTS)
+    stations = await itx.client.fetch_all_stations()
     return [
         app_commands.Choice(name=stn.station_name, value=stn.station_name)
         for stn in stations
@@ -448,17 +310,10 @@ async def station_autocomplete(itx: discord.Interaction[RadioBot], current: str)
     ]
 
 
-# @station_set.autocomplete("station_name")
 async def station_set_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
-    """Autocomplete callback for stations created by the user."""
+    """Autocomplete callback for all stations created by the user."""
 
-    stations = await asyncio.to_thread(
-        _query_stations,
-        itx.client.db_connection,
-        SELECT_STATIONS_BY_OWNER_STATEMENT,
-        (itx.user.id,),
-    )
-
+    stations = await itx.client.fetch_owner_stations(itx.user.id)
     return [
         app_commands.Choice(name=stn.station_name, value=stn.station_name)
         for stn in stations
@@ -497,30 +352,22 @@ class RadioGroup(app_commands.Group):
     ) -> None:
         assert itx.guild  # Known quantity in guild-only command.
 
-        station_records = await asyncio.to_thread(
-            _query_stations,
-            itx.client.db_connection,
-            SELECT_STATIONS_BY_NAME_STATEMENT,
-            (station,),
-        )
-        if not station_records:
+        station_record = await itx.client.fetch_named_station(station)
+        if not station_record:
             await itx.response.send_message(
                 "That station doesn't exist. Did you mean to select a different one or make your own?",
             )
             return
-        stn_id = station_records[0].station_id
-        roles = convert_list_role(managing_roles, itx.guild) if managing_roles else None
+        stn_id = station_record.station_id
+        roles = convert_list_to_roles(managing_roles, itx.guild) if managing_roles else None
 
-        record = await asyncio.to_thread(
-            _add_radio,
-            itx.client.db_connection,
+        record = await itx.client.save_radio(
             guild_id=itx.guild.id,
             channel_id=channel.id,
             station_id=stn_id,
             always_shuffle=always_shuffle,
             managing_roles=roles,
         )
-        itx.client.radio_enabled_guilds.add(itx.guild.id)
 
         # TODO: Update the player immediately with new info if possible.
         if record:
@@ -573,7 +420,9 @@ class RadioGroup(app_commands.Group):
     async def radio_next(self: Self, itx: discord.Interaction[RadioBot]) -> None:
         assert itx.guild  # Known quantity in guild-only command.
 
-        vc: RadioPlayer | None = itx.guild.voice_client  # type: ignore # Known type at runtime.
+        vc = itx.guild.voice_client
+        assert isinstance(vc, RadioPlayer | None)
+
         if vc:
             await vc.stop()
             await itx.response.send_message("Skipping current track...")
@@ -615,29 +464,22 @@ class StationGroup(app_commands.Group):
     @app_commands.command(name="info", description="Get information about an available 'radio station'.")
     @app_commands.autocomplete(station_name=station_autocomplete)
     async def station_info(self: Self, itx: discord.Interaction[RadioBot], station_name: str) -> None:
-        records = await asyncio.to_thread(
-            _query_stations,
-            itx.client.db_connection,
-            SELECT_STATIONS_BY_NAME_STATEMENT,
-            (station_name,),
-        )
-        if records and (station := records[0]):
-            await itx.response.send_message(embed=station.display_embed(), ephemeral=True)
+        station_record = await itx.client.fetch_named_station(station_name)
+        if station_record:
+            await itx.response.send_message(embed=station_record.display_embed(), ephemeral=True)
         else:
             await itx.response.send_message("No such station found.")
 
 
-bot.tree.add_command(RadioGroup())
-bot.tree.add_command(StationGroup())
-
-
-@bot.tree.command(description="See what's currently playing on the radio.")
+@app_commands.command(description="See what's currently playing on the radio.")
 @app_commands.describe(level="What to get information about: the currently playing track, station, or radio.")
 @app_commands.guild_only()
 async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "station", "radio"] = "track") -> None:
     assert itx.guild  # Known quantity in guild-only command.
 
-    vc: RadioPlayer | None = itx.guild.voice_client  # type: ignore # Known at runtime.
+    vc = itx.guild.voice_client
+    assert isinstance(vc, RadioPlayer | None)  # Known at runtime.
+
     if vc:
         if level == "track" and vc.current:
             embed = await format_track_embed(discord.Embed(color=0x0389DA, title="Currently Playing"), vc.current)
@@ -650,15 +492,15 @@ async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "s
         await itx.response.send_message("No radio currently active in this server.")
 
 
-@bot.tree.command(description="See or change the volume of the radio.")
+@app_commands.command(description="See or change the volume of the radio.")
 @app_commands.guild_only()
 async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) -> None:
     # Known quantities in guild-only command.
     assert itx.guild
     assert isinstance(itx.user, discord.Member)
 
-    vc: RadioPlayer | None = itx.guild.voice_client  # type: ignore # Known at runtime.
-
+    vc = itx.guild.voice_client
+    assert isinstance(vc, RadioPlayer | None)  # Known at runtime.
     if vc:
         if volume is None:
             await itx.response.send_message(f"Volume is currently set to {vc.volume}.", ephemeral=True)
@@ -680,14 +522,14 @@ async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) 
         await itx.response.send_message("No radio currently active in this server.")
 
 
-@bot.tree.command(description="Get a link to invite this bot to a server.")
+@app_commands.command(description="Get a link to invite this bot to a server.")
 async def invite(itx: discord.Interaction[RadioBot]) -> None:
     embed = discord.Embed(description="Click the link below to invite me to one of your servers.")
     view = discord.ui.View().add_item(discord.ui.Button(label="Invite", url=itx.client.invite_link))
     await itx.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(description="Basic instructions for setting up your radio.")
+@app_commands.command(description="Basic instructions for setting up your radio.")
 async def setup_help(itx: discord.Interaction[RadioBot]) -> None:
     description = (
         "1. If you want a custom radio station, create one with a specific song/playlist link via `/station set`.\n"
@@ -699,48 +541,302 @@ async def setup_help(itx: discord.Interaction[RadioBot]) -> None:
     await itx.response.send_message(embed=embed)
 
 
-#######################################
-### Dev stuff - To be removed later.
-#######################################
-@bot.tree.error
-async def on_app_command_error(itx: discord.Interaction, error: app_commands.AppCommandError) -> None:
-    log.exception("App command error", exc_info=error)
+APP_COMMANDS = [RadioGroup(), StationGroup(), current, volume, invite, setup_help]
 
 
-@bot.event
-async def on_command_error(ctx: commands.Context[RadioBot], error: commands.CommandError) -> None:
-    log.exception("Regular command error", exc_info=error)
-
-
-@bot.command()
+#######################
+### Dev stuff
+### TODO: Remove later.
+#######################
+@commands.command()
 async def shutdown(ctx: commands.Context[RadioBot]) -> None:
     await ctx.send("Shutting down bot...")
-    await bot.close()
+    await ctx.bot.close()
 
 
-@bot.command("sync")
+@commands.command("sync")
 async def sync_(ctx: commands.Context[RadioBot]) -> None:
-    await bot.tree.sync()
+    await ctx.bot.tree.sync()
     await ctx.send("Synced app commands.")
+
+
+DEV_COMMANDS = [shutdown, sync_]
+
+
+##########################
+### Custom Wavelink Player
+##########################
+class RadioPlayer(wavelink.Player):
+    def __init__(self: Self, *args: Any, radio_info: GuildRadioInfo, **kwargs: Any) -> None:
+        self.radio_info = radio_info
+        super().__init__(*args, *kwargs)
+
+    @property
+    def station_info(self: Self) -> StationInfo:
+        return self.radio_info.station
+
+
+#######################
+### Main Discord Client
+#######################
+class RadioBot(commands.AutoShardedBot):
+    def __init__(self: Self, config: dict[str, Any]) -> None:
+        # TODO: Convert back to AutoShardedClient later.
+        self.config = config
+        super().__init__(
+            command_prefix=commands.when_mentioned,
+            intents=discord.Intents.default(),  # Can be reduced later.
+            activity=discord.Game(name="https://github.com/Sachaa-Thanasius/discord-radiobot"),
+        )
+        # self.tree = app_commands.CommandTree(self)
+
+        # Connect to the database that will store the radio information.
+        db_path = Path(self.config["DATABASE"]["path"])
+        resolved_path_as_str = str(db_path.resolve())  # Need to account for file not existing.
+        self.db_connection = apsw.Connection(resolved_path_as_str)
+
+    async def on_connect(self: Self) -> None:
+        # Create an invite link.
+        await self.wait_until_ready()
+        data = await self.application_info()
+        perms = discord.Permissions(274881367040)
+        self.invite_link = discord.utils.oauth_url(data.id, permissions=perms)
+
+    async def setup_hook(self: Self) -> None:
+        """Perform a few operations before the bot connects to the Discord Gateway."""
+
+        # Connect to the Lavalink node that will provide the music.
+        node = wavelink.Node(**self.config["LAVALINK"])
+        sc = spotify.SpotifyClient(**self.config["SPOTIFY"]) if ("SPOTIFY" in self.config) else None
+        await wavelink.NodePool.connect(client=self, nodes=[node], spotify=sc)
+
+        # Initialize the database and start the loop.
+        self._radio_enabled_guilds: set[int] = await asyncio.to_thread(_setup_db, self.db_connection)
+        self.radio_loop.start()
+
+        # Add the app commands to the tree.
+        for cmd in APP_COMMANDS:
+            self.tree.add_command(cmd)
+
+        # Add the dev commands to the bot.
+        # TODO: Remove later.
+        for cmd in DEV_COMMANDS:
+            self.add_command(cmd)
+
+        # In production, this should rarely run, so it's fine to automate it?
+        await self.tree.sync()
+
+    async def close(self: Self) -> None:
+        self.radio_loop.cancel()
+        return await super().close()
+
+    async def on_wavelink_node_ready(self: Self, node: wavelink.Node) -> None:
+        """Called when the Node you are connecting to has initialised and successfully connected to Lavalink."""
+
+        log.info("Wavelink node %s is ready!", node.id)
+
+    async def on_wavelink_track_end(self: Self, payload: wavelink.TrackEventPayload) -> None:
+        """Called when the current track has finished playing.
+
+        Plays the next track in the queue so long as the player hasn't disconnected.
+        """
+
+        player = payload.player
+        assert isinstance(player, RadioPlayer)
+
+        if player.is_connected():
+            queue_length_before = len(player.queue)
+            next_track = player.queue.get()
+            await player.play(next_track)
+            if queue_length_before == 1 and player.radio_info.always_shuffle:
+                player.queue.shuffle()
+        else:
+            await player.stop()
+
+    async def start_guild_radio(self: Self, radio_info: GuildRadioInfo) -> None:
+        """Create a radio voice client for a guild and start its preset station playlist.
+
+        Parameters
+        ----------
+        radio_info : GuildRadioInfo
+            A dataclass instance with the guild radio's settings.
+        """
+
+        # Initialize a guild's radio voice client.
+        guild = self.get_guild(radio_info.guild_id)
+        if not guild:  # Technically possible if a guild has been deleted?
+            return
+
+        voice_channel = guild.get_channel(radio_info.channel_id)
+        assert isinstance(voice_channel, discord.abc.Connectable)
+
+        # This player should be compatible with discord.py's connect.
+        player = RadioPlayer(radio_info=radio_info)
+        vc = await voice_channel.connect(cls=player)  # pyright: ignore [reportGeneralTypeIssues]
+
+        # Get the playlist of the guild's registered radio station and play it on loop.
+        converted = await WavelinkTrackConverter.convert(radio_info.station.playlist_link)
+        if isinstance(converted, Iterable):
+            for sub_item in converted:
+                await vc.queue.put_wait(sub_item)
+        elif isinstance(converted, spotify.SpotifyAsyncIterator):
+            # Awkward casting to satisfy pyright since wavelink isn't fully typed.
+            async for sub_item in cast(AsyncIterator[spotify.SpotifyTrack], converted):
+                await vc.queue.put_wait(sub_item)
+        else:
+            await vc.queue.put_wait(converted)
+
+        vc.queue.loop_all = True
+        if radio_info.always_shuffle:
+            vc.queue.shuffle()
+
+        await vc.play(vc.queue.get())
+
+    @tasks.loop(seconds=10.0)
+    async def radio_loop(self: Self) -> None:
+        """The main loop for the radios.
+
+        It (re)connects voice clients to voice channels and plays preset stations.
+        """
+
+        inactive_radio_guilds = [
+            guild
+            for guild_id in self._radio_enabled_guilds
+            if (guild := self.get_guild(guild_id)) and not guild.voice_client
+        ]
+
+        radio_results = await asyncio.to_thread(
+            _get_all_guilds_radio_info,
+            self.db_connection,
+            [(guild.id,) for guild in inactive_radio_guilds],
+        )
+
+        # TODO: Check if this provides any benefit over a regular for loop.
+        async with asyncio.TaskGroup() as tg:
+            for radio in radio_results:
+                tg.create_task(self.start_guild_radio(radio))
+
+    @radio_loop.before_loop
+    async def radio_loop_before(self: Self) -> None:
+        """Ensure the bot is connected to the Discord Gateway before the loop starts."""
+
+        await self.wait_until_ready()
+
+    async def fetch_all_stations(self: Self) -> list[StationInfo]:
+        """Fetch all existing radio stations.
+
+        Returns
+        -------
+        list[StationInfo]
+            A list of dataclasses instances with information about each station.
+        """
+
+        return await asyncio.to_thread(_query_stations, self.db_connection, SELECT_STATIONS_STATEMENTS)
+
+    async def fetch_owner_stations(self: Self, owner_id: int) -> list[StationInfo]:
+        """Fetch all existing radio stations created by a given Discord User.
+
+        Parameters
+        ----------
+        owner_id : int
+            The Discord ID of the person that created the stations.
+
+        Returns
+        -------
+        list[StationInfo]
+            A list of dataclasses instances with information about each station.
+        """
+
+        return await asyncio.to_thread(
+            _query_stations,
+            self.db_connection,
+            SELECT_STATIONS_BY_OWNER_STATEMENT,
+            (owner_id,),
+        )
+
+    async def fetch_named_station(self: Self, station_name: str) -> StationInfo | None:
+        """Fetch the radio station with a specific name.
+
+        Parameters
+        ----------
+        station_name : str
+            The name of the station.
+
+        Returns
+        -------
+        StationInfo | None
+            A dataclass instance with information about the station, or None if not found.
+        """
+
+        records = await asyncio.to_thread(
+            _query_stations,
+            self.db_connection,
+            SELECT_STATIONS_BY_NAME_STATEMENT,
+            (station_name,),
+        )
+        return records[0] if records else None
+
+    async def save_radio(
+        self: Self,
+        guild_id: int,
+        channel_id: int,
+        station_id: int,
+        always_shuffle: bool,
+        managing_roles: list[discord.Role] | None,
+    ) -> GuildRadioInfo | None:
+        """Create or update a radio.
+
+        Parameters
+        ----------
+        guild_id : int
+            The Discord ID for the guild this radio will be active in.
+        channel_id : int
+            The Discord ID for the channel this radio will be active in.
+        station_id : int
+            The ID of the radio's new station.
+        always_shuffle : bool
+            Whether to always shuffle the station's playlist when the radio starts and as it cycles.
+        managing_roles : list[discord.Role] | None
+            The Discord roles whose members are allowed to change radio and station settings within this guild.
+
+        Returns
+        -------
+        GuildRadioInfo | None
+            A dataclass instance with information about the newly created or updated radio, or None if the operation
+            failed.
+        """
+
+        self._radio_enabled_guilds.add(guild_id)
+        return await asyncio.to_thread(
+            _add_radio,
+            self.db_connection,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            station_id=station_id,
+            always_shuffle=always_shuffle,
+            managing_roles=managing_roles,
+        )
+
+
+def run_bot() -> None:
+    with Path("config.toml").open("rb") as file_:
+        config = tomllib.load(file_)
+
+    try:
+        token: str = config["DISCORD"]["token"]
+    except KeyError as err:
+        err.add_note("You're missing a Discord bot token in your config file.")
+        raise
+
+    bot = RadioBot(config)
+    bot.run(token)
 
 
 def main() -> None:
     """Launch the bot."""
 
-    """
-    # Logging for dev.
-    log_sqlite()
-    logging.getLogger("wavelink").setLevel(logging.INFO)
-    logging.getLogger().setLevel(logging.INFO)
-    """
     # TODO: Create a CLI here to avoid the need for the TOML file.
-    # Start the bot.
-    with Path("config.toml").open("rb") as file_:
-        config = tomllib.load(file_)
-
-    token: str = config["DISCORD"]["token"]
-    bot.config = config
-    bot.run(token)
+    run_bot()
 
 
 if __name__ == "__main__":
