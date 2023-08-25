@@ -29,9 +29,6 @@ AnyTrackIterable: TypeAlias = list[wavelink.Playable] | list[spotify.SpotifyTrac
 
 log = logging.getLogger(__name__)
 
-with Path("config.toml").open("rb") as file_:
-    config = tomllib.load(file_)
-
 INITIALIZATION_STATEMENTS = """
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
@@ -309,8 +306,11 @@ class RadioPlayer(wavelink.Player):
 
 
 class RadioBot(commands.AutoShardedBot):
+    config: dict[str, Any]
+
     def __init__(self: Self) -> None:
         # TODO: Convert back to AutoShardedClient later.
+
         super().__init__(
             command_prefix=commands.when_mentioned,
             intents=discord.Intents.default(),  # Can be reduced later.
@@ -319,7 +319,7 @@ class RadioBot(commands.AutoShardedBot):
         # self.tree = app_commands.CommandTree(self)
 
         # Connect to the database that will store the radio information.
-        db_path = Path(config["DATABASE"]["path"])
+        db_path = Path(self.config["DATABASE"]["path"])
         resolved_path_as_str = str(db_path.resolve())  # Need to account for file not existing.
         self.db_connection = apsw.Connection(resolved_path_as_str)
 
@@ -332,8 +332,8 @@ class RadioBot(commands.AutoShardedBot):
 
     async def setup_hook(self: Self) -> None:
         # Connect to the Lavalink node that will provide the music.
-        node = wavelink.Node(**config["LAVALINK"])
-        sc = spotify.SpotifyClient(**config["SPOTIFY"]) if ("SPOTIFY" in config) else None
+        node = wavelink.Node(**self.config["LAVALINK"])
+        sc = spotify.SpotifyClient(**self.config["SPOTIFY"]) if ("SPOTIFY" in self.config) else None
         await wavelink.NodePool.connect(client=self, nodes=[node], spotify=sc)
 
         # Initialize the database and start the loop.
@@ -423,7 +423,6 @@ async def on_wavelink_track_end(payload: wavelink.TrackEventPayload) -> None:
     player = payload.player
 
     if player.is_connected():
-        # before_queue_length = len(player.queue)
         next_track = player.queue.get()
         await player.play(next_track)
         # TODO: Make sure to shuffle the queue if it's set to always shuffle.
@@ -434,161 +433,10 @@ async def on_wavelink_track_end(payload: wavelink.TrackEventPayload) -> None:
 ########################
 ### Application commands
 ########################
-radio_group = app_commands.Group(
-    name="radio",
-    description="The group of commands responsible for setting up, modifying, and using the radio.",
-    guild_only=True,
-    default_permissions=discord.Permissions(manage_guild=True),
-)
 
 
-@radio_group.command(
-    name="set",
-    description="Create or update your server's radio player, specifically its location and what it will play.",
-)
-@app_commands.describe(
-    channel="The channel the radio should automatically play in and, if necessary, reconnect to.",
-    station="The 'radio station' with the music you want playing. Create your own with /station set.",
-    always_shuffle="Whether the station should shuffle its internal playlist whenever it loops.",
-    managing_roles="The roles that have permission to edit the server radio. Comma-separated list if more than one.",
-)
-async def radio_set(
-    itx: discord.Interaction[RadioBot],
-    channel: discord.VoiceChannel | discord.StageChannel,
-    station: str,
-    always_shuffle: bool = True,
-    managing_roles: str | None = None,
-) -> None:
-    assert itx.guild  # Known quantity in guild-only command.
-
-    station_records = await asyncio.to_thread(
-        _query_stations,
-        itx.client.db_connection,
-        SELECT_STATIONS_BY_NAME_STATEMENT,
-        (station,),
-    )
-    if not station_records:
-        await itx.response.send_message(
-            "That station doesn't exist. Did you mean to select a different one or make your own?",
-        )
-        return
-    stn_id = station_records[0].station_id
-    roles = convert_list_role(managing_roles, itx.guild) if managing_roles else None
-
-    record = await asyncio.to_thread(
-        _add_radio,
-        itx.client.db_connection,
-        guild_id=itx.guild.id,
-        channel_id=channel.id,
-        station_id=stn_id,
-        always_shuffle=always_shuffle,
-        managing_roles=roles,
-    )
-    itx.client.radio_enabled_guilds.add(itx.guild.id)
-
-    # TODO: Update the player immediately with new info if possible.
-    if record:
-        content = f"Radio with station {record.station.station_name} set in <#{record.channel_id}>."
-    else:
-        content = f"Unable to set radio in {channel.mention} with station {station} at this time."
-    await itx.response.send_message(content)
-
-
-@radio_group.command(
-    name="get",
-    description="Get information about your server's current radio setup. May need /restart to be up to date.",
-)
-async def radio_get(itx: discord.Interaction[RadioBot]) -> None:
-    assert itx.guild_id  # Known quantity in guild-only command.
-
-    local_radio_results = await asyncio.to_thread(
-        _get_all_guilds_radio_info,
-        itx.client.db_connection,
-        [(itx.guild_id,)],
-    )
-
-    if local_radio_results and (local_radio := local_radio_results[0]):
-        await itx.response.send_message(embed=local_radio.display_embed())
-    else:
-        await itx.response.send_message("No radio found for this guild.")
-
-
-@radio_group.command(
-    name="restart",
-    description="Restart your server's radio. Acts as a reset in case you change something.",
-)
-async def radio_restart(itx: discord.Interaction[RadioBot]) -> None:
-    assert itx.guild  # Known quantity in guild-only command.
-
-    if vc := itx.guild.voice_client:
-        await vc.disconnect(force=True)
-
-    guild_radio_records = await asyncio.to_thread(
-        _get_all_guilds_radio_info,
-        itx.client.db_connection,
-        [(itx.guild.id,)],
-    )
-
-    if guild_radio_records and (record := guild_radio_records[0]):
-        await itx.client.start_guild_radio(record)
-        await itx.response.send_message("Restarting radio now...")
-    else:
-        await itx.response.send_message("No radio found for this guild.")
-
-
-@radio_group.command(name="next", description="Skip to the next track.")
-async def radio_next(itx: discord.Interaction[RadioBot]) -> None:
-    assert itx.guild  # Known quantity in guild-only command.
-
-    vc: RadioPlayer | None = itx.guild.voice_client  # type: ignore # Known type at runtime.
-    if vc:
-        await vc.stop()
-        await itx.response.send_message("Skipping current track...")
-    else:
-        await itx.response.send_message("No radio currently active in this server.")
-
-
-station_group = app_commands.Group(
-    name="station",
-    description="The group of commands responsible for setting up, modifying, and using 'radio stations'.",
-    guild_only=True,
-)
-
-
-@station_group.command(
-    name="set",
-    description="Create or edit a 'radio station' that can be used in any server with this bot.",
-)
-async def station_set(itx: discord.Interaction[RadioBot], station_name: str, playlist_link: str) -> None:
-    records = await asyncio.to_thread(
-        _query_stations,
-        itx.client.db_connection,
-        UPSERT_STATION_STATEMENT,
-        (station_name, playlist_link, itx.user.id),
-    )
-    if records and (upd_stn := records[0]):
-        content = f"Station {upd_stn.station_name} set to use `<{upd_stn.playlist_link}>`."
-    else:
-        content = f"Could not set station {station_name} at this time."
-    await itx.response.send_message(content)
-
-
-@station_group.command(name="info", description="Get information about an available 'radio station'.")
-async def station_info(itx: discord.Interaction[RadioBot], station_name: str) -> None:
-    records = await asyncio.to_thread(
-        _query_stations,
-        itx.client.db_connection,
-        SELECT_STATIONS_BY_NAME_STATEMENT,
-        (station_name,),
-    )
-    if records and (station := records[0]):
-        await itx.response.send_message(embed=station.display_embed(), ephemeral=True)
-    else:
-        await itx.response.send_message("No such station found.")
-
-
-@radio_set.autocomplete("station")
-@station_info.autocomplete("station_name")
+# @radio_set.autocomplete("station")
+# @station_info.autocomplete("station_name")
 async def station_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
     """Autocomplete callback for all existing stations."""
 
@@ -600,7 +448,7 @@ async def station_autocomplete(itx: discord.Interaction[RadioBot], current: str)
     ]
 
 
-@station_set.autocomplete("station_name")
+# @station_set.autocomplete("station_name")
 async def station_set_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
     """Autocomplete callback for stations created by the user."""
 
@@ -618,8 +466,169 @@ async def station_set_autocomplete(itx: discord.Interaction[RadioBot], current: 
     ]
 
 
-bot.tree.add_command(radio_group)
-bot.tree.add_command(station_group)
+class RadioGroup(app_commands.Group):
+    # TODO: Create a radio_delete command.
+    def __init__(self: Self) -> None:
+        super().__init__(
+            name="radio",
+            description="The group of commands responsible for setting up, modifying, and using the radio.",
+            guild_only=True,
+            default_permissions=discord.Permissions(manage_guild=True),
+        )
+
+    @app_commands.command(
+        name="set",
+        description="Create or update your server's radio player, specifically its location and what it will play.",
+    )
+    @app_commands.describe(
+        channel="The channel the radio should automatically play in and, if necessary, reconnect to.",
+        station="The 'radio station' with the music you want playing. Create your own with /station set.",
+        always_shuffle="Whether the station should shuffle its internal playlist whenever it loops.",
+        managing_roles="The roles with enhanced server radio permissions. Comma-separated list if more than one.",
+    )
+    @app_commands.autocomplete(station=station_autocomplete)
+    async def radio_set(
+        self: Self,
+        itx: discord.Interaction[RadioBot],
+        channel: discord.VoiceChannel | discord.StageChannel,
+        station: str,
+        always_shuffle: bool = True,
+        managing_roles: str | None = None,
+    ) -> None:
+        assert itx.guild  # Known quantity in guild-only command.
+
+        station_records = await asyncio.to_thread(
+            _query_stations,
+            itx.client.db_connection,
+            SELECT_STATIONS_BY_NAME_STATEMENT,
+            (station,),
+        )
+        if not station_records:
+            await itx.response.send_message(
+                "That station doesn't exist. Did you mean to select a different one or make your own?",
+            )
+            return
+        stn_id = station_records[0].station_id
+        roles = convert_list_role(managing_roles, itx.guild) if managing_roles else None
+
+        record = await asyncio.to_thread(
+            _add_radio,
+            itx.client.db_connection,
+            guild_id=itx.guild.id,
+            channel_id=channel.id,
+            station_id=stn_id,
+            always_shuffle=always_shuffle,
+            managing_roles=roles,
+        )
+        itx.client.radio_enabled_guilds.add(itx.guild.id)
+
+        # TODO: Update the player immediately with new info if possible.
+        if record:
+            content = f"Radio with station {record.station.station_name} set in <#{record.channel_id}>."
+        else:
+            content = f"Unable to set radio in {channel.mention} with station {station} at this time."
+        await itx.response.send_message(content)
+
+    @app_commands.command(
+        name="get",
+        description="Get information about your server's current radio setup. May need /restart to be up to date.",
+    )
+    async def radio_get(self: Self, itx: discord.Interaction[RadioBot]) -> None:
+        assert itx.guild_id  # Known quantity in guild-only command.
+
+        local_radio_results = await asyncio.to_thread(
+            _get_all_guilds_radio_info,
+            itx.client.db_connection,
+            [(itx.guild_id,)],
+        )
+
+        if local_radio_results and (local_radio := local_radio_results[0]):
+            await itx.response.send_message(embed=local_radio.display_embed())
+        else:
+            await itx.response.send_message("No radio found for this guild.")
+
+    @app_commands.command(
+        name="restart",
+        description="Restart your server's radio. Acts as a reset in case you change something.",
+    )
+    async def radio_restart(self: Self, itx: discord.Interaction[RadioBot]) -> None:
+        assert itx.guild  # Known quantity in guild-only command.
+
+        if vc := itx.guild.voice_client:
+            await vc.disconnect(force=True)
+
+        guild_radio_records = await asyncio.to_thread(
+            _get_all_guilds_radio_info,
+            itx.client.db_connection,
+            [(itx.guild.id,)],
+        )
+
+        if guild_radio_records and (record := guild_radio_records[0]):
+            await itx.client.start_guild_radio(record)
+            await itx.response.send_message("Restarting radio now...")
+        else:
+            await itx.response.send_message("No radio found for this guild.")
+
+    @app_commands.command(name="next", description="Skip to the next track.")
+    async def radio_next(self: Self, itx: discord.Interaction[RadioBot]) -> None:
+        assert itx.guild  # Known quantity in guild-only command.
+
+        vc: RadioPlayer | None = itx.guild.voice_client  # type: ignore # Known type at runtime.
+        if vc:
+            await vc.stop()
+            await itx.response.send_message("Skipping current track...")
+        else:
+            await itx.response.send_message("No radio currently active in this server.")
+
+
+class StationGroup(app_commands.Group):
+    def __init__(self: Self) -> None:
+        super().__init__(
+            name="station",
+            description="The group of commands responsible for setting up, modifying, and using 'radio stations'.",
+            guild_only=True,
+        )
+
+    @app_commands.command(
+        name="set",
+        description="Create or edit a 'radio station' that can be used in any server with this bot.",
+    )
+    @app_commands.autocomplete(station_name=station_set_autocomplete)
+    async def station_set(
+        self: Self,
+        itx: discord.Interaction[RadioBot],
+        station_name: str,
+        playlist_link: str,
+    ) -> None:
+        records = await asyncio.to_thread(
+            _query_stations,
+            itx.client.db_connection,
+            UPSERT_STATION_STATEMENT,
+            (station_name, playlist_link, itx.user.id),
+        )
+        if records and (upd_stn := records[0]):
+            content = f"Station {upd_stn.station_name} set to use `<{upd_stn.playlist_link}>`."
+        else:
+            content = f"Could not set station {station_name} at this time."
+        await itx.response.send_message(content)
+
+    @app_commands.command(name="info", description="Get information about an available 'radio station'.")
+    @app_commands.autocomplete(station_name=station_autocomplete)
+    async def station_info(self: Self, itx: discord.Interaction[RadioBot], station_name: str) -> None:
+        records = await asyncio.to_thread(
+            _query_stations,
+            itx.client.db_connection,
+            SELECT_STATIONS_BY_NAME_STATEMENT,
+            (station_name,),
+        )
+        if records and (station := records[0]):
+            await itx.response.send_message(embed=station.display_embed(), ephemeral=True)
+        else:
+            await itx.response.send_message("No such station found.")
+
+
+bot.tree.add_command(RadioGroup())
+bot.tree.add_command(StationGroup())
 
 
 @bot.tree.command(description="See what's currently playing on the radio.")
@@ -718,15 +727,19 @@ async def sync_(ctx: commands.Context[RadioBot]) -> None:
 def main() -> None:
     """Launch the bot."""
 
-    '''
+    """
     # Logging for dev.
     log_sqlite()
     logging.getLogger("wavelink").setLevel(logging.INFO)
     logging.getLogger().setLevel(logging.INFO)
-    '''
+    """
     # TODO: Create a CLI here to avoid the need for the TOML file.
     # Start the bot.
+    with Path("config.toml").open("rb") as file_:
+        config = tomllib.load(file_)
+
     token: str = config["DISCORD"]["token"]
+    bot.config = config
     bot.run(token)
 
 
