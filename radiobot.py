@@ -11,14 +11,12 @@ from collections.abc import AsyncIterator, Iterable
 from itertools import chain
 from pathlib import Path
 from typing import Any, Literal, Self, TypeAlias, cast
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import apsw
 import attrs
 import discord
 import wavelink
-import yarl
-from apsw.ext import log_sqlite
 from discord import app_commands
 from discord.ext import commands, tasks
 from wavelink.ext import spotify
@@ -217,27 +215,27 @@ class WavelinkTrackConverter:
     def _get_search_type(argument: str) -> type[AnyTrack]:
         """Get the searchable wavelink class that matches the argument string closest."""
 
-        check = yarl.URL(argument)
-        print("yarl: ", check.scheme, check.host, check.parts)
-        print("urllib: ", "\n", urlparse(argument))
+        # Testing the use of urllib here instead of yarl.
+        check = urlparse(argument)
+        check_query = parse_qs(check.query)
 
         if (
-            (not check.host and not check.scheme)
-            or (check.host in ("youtube.com", "www.youtube.com", "m.youtube.com") and "v" in check.query)
+            (not check.netloc and not check.scheme)
+            or (check.netloc in ("youtube.com", "www.youtube.com", "m.youtube.com") and "v" in check_query)
             or check.scheme == "ytsearch"
         ):
             search_type = wavelink.YouTubeTrack
         elif (
-            check.host in ("youtube.com", "www.youtube.com", "m.youtube.com") and "list" in check.query
+            check.netloc in ("youtube.com", "www.youtube.com", "m.youtube.com") and "list" in check_query
         ) or check.scheme == "ytpl":
             search_type = wavelink.YouTubePlaylist
-        elif check.host == "music.youtube.com" or check.scheme == "ytmsearch":
+        elif check.netloc == "music.youtube.com" or check.scheme == "ytmsearch":
             search_type = wavelink.YouTubeMusicTrack
-        elif check.host in ("soundcloud.com", "www.soundcloud.com") and "sets" in check.parts:
+        elif check.netloc in ("soundcloud.com", "www.soundcloud.com") and "/sets/" in check.path:
             search_type = wavelink.SoundCloudPlaylist
-        elif check.host in ("soundcloud.com", "www.soundcloud.com") or check.scheme == "scsearch":
+        elif check.netloc in ("soundcloud.com", "www.soundcloud.com") or check.scheme == "scsearch":
             search_type = wavelink.SoundCloudTrack
-        elif check.host in ("spotify.com", "open.spotify.com"):
+        elif check.netloc in ("spotify.com", "open.spotify.com"):
             search_type = spotify.SpotifyTrack
         else:
             search_type = wavelink.GenericTrack
@@ -342,13 +340,18 @@ class RadioBot(commands.AutoShardedBot):
         self.radio_enabled_guilds: set[int] = await asyncio.to_thread(_setup_db, self.db_connection)
         self.radio_loop.start()
 
+        # await self.tree.sync()    # In production, this should run rarely, so it's fine to automate it.
+
     async def close(self: Self) -> None:
         self.radio_loop.cancel()
         return await super().close()
 
     async def start_guild_radio(self: Self, radio_info: GuildRadioInfo) -> None:
         # Initialize the guild's specific radio voice client.
-        guild: discord.Guild = self.get_guild(radio_info.guild_id)  # type: ignore # Known at runtime.
+        guild = self.get_guild(radio_info.guild_id)
+        if not guild:  # Technically possible if a guild is deleted?
+            return
+
         voice_channel: discord.abc.Connectable = guild.get_channel(radio_info.channel_id)  # type: ignore # Known
         player = RadioPlayer(radio_info=radio_info)
         vc = await voice_channel.connect(cls=player)  # type: ignore # Should be valid Player instance.
@@ -365,7 +368,7 @@ class RadioBot(commands.AutoShardedBot):
         else:
             await vc.queue.put_wait(converted)
 
-        vc.queue.loop_all = True  # TODO: Figure out why it doesn't loop.
+        vc.queue.loop_all = True
         if radio_info.always_shuffle:
             vc.queue.shuffle()
 
@@ -388,8 +391,9 @@ class RadioBot(commands.AutoShardedBot):
             self.db_connection,
             [(guild.id,) for guild in inactive_radio_guilds],
         )
-        for radio in radio_results:
-            await self.start_guild_radio(radio)
+        async with asyncio.TaskGroup() as tg:
+            for radio in radio_results:
+                tg.create_task(self.start_guild_radio(radio))
 
     @radio_loop.before_loop
     async def radio_loop_before(self: Self) -> None:
@@ -399,9 +403,9 @@ class RadioBot(commands.AutoShardedBot):
 bot = RadioBot()
 
 
-##################################
-### Discord and Wavelink listeners
-##################################
+######################
+### Wavelink listeners
+######################
 @bot.event
 async def on_wavelink_node_ready(node: wavelink.Node) -> None:
     """Called when the Node you are connecting to has initialised and successfully connected to Lavalink."""
@@ -419,9 +423,10 @@ async def on_wavelink_track_end(payload: wavelink.TrackEventPayload) -> None:
     player = payload.player
 
     if player.is_connected():
-        next_track = await player.queue.get_wait()
-        log.info("Next track: %r", next_track)
+        # before_queue_length = len(player.queue)
+        next_track = player.queue.get()
         await player.play(next_track)
+        # TODO: Make sure to shuffle the queue if it's set to always shuffle.
     else:
         await player.stop()
 
@@ -481,6 +486,7 @@ async def radio_set(
     )
     itx.client.radio_enabled_guilds.add(itx.guild.id)
 
+    # TODO: Update the player immediately with new info if possible.
     if record:
         content = f"Radio with station {record.station.station_name} set in <#{record.channel_id}>."
     else:
@@ -530,7 +536,17 @@ async def radio_restart(itx: discord.Interaction[RadioBot]) -> None:
         await itx.response.send_message("No radio found for this guild.")
 
 
-bot.tree.add_command(radio_group)
+@radio_group.command(name="next", description="Skip to the next track.")
+async def radio_next(itx: discord.Interaction[RadioBot]) -> None:
+    assert itx.guild  # Known quantity in guild-only command.
+
+    vc: RadioPlayer | None = itx.guild.voice_client  # type: ignore # Known type at runtime.
+    if vc:
+        await vc.stop()
+        await itx.response.send_message("Skipping current track...")
+    else:
+        await itx.response.send_message("No radio currently active in this server.")
+
 
 station_group = app_commands.Group(
     name="station",
@@ -602,10 +618,12 @@ async def station_set_autocomplete(itx: discord.Interaction[RadioBot], current: 
     ]
 
 
+bot.tree.add_command(radio_group)
 bot.tree.add_command(station_group)
 
 
 @bot.tree.command(description="See what's currently playing on the radio.")
+@app_commands.describe(level="What to get information about: the currently playing track, station, or radio.")
 @app_commands.guild_only()
 async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "station", "radio"] = "track") -> None:
     assert itx.guild  # Known quantity in guild-only command.
@@ -630,7 +648,7 @@ async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) 
     assert itx.guild
     assert isinstance(itx.user, discord.Member)
 
-    vc: RadioPlayer | None = itx.guild.voice_client  # type: ignore # Known at runtime
+    vc: RadioPlayer | None = itx.guild.voice_client  # type: ignore # Known at runtime.
 
     if vc:
         if volume is None:
@@ -693,15 +711,24 @@ async def shutdown(ctx: commands.Context[RadioBot]) -> None:
 
 @bot.command("sync")
 async def sync_(ctx: commands.Context[RadioBot]) -> None:
-    await ctx.send("Syncing app commands...")
     await bot.tree.sync()
+    await ctx.send("Synced app commands.")
 
 
 def main() -> None:
+    """Launch the bot."""
+
+    '''
+    # Logging for dev.
     log_sqlite()
+    logging.getLogger("wavelink").setLevel(logging.INFO)
+    logging.getLogger().setLevel(logging.INFO)
+    '''
+    # TODO: Create a CLI here to avoid the need for the TOML file.
+    # Start the bot.
     token: str = config["DISCORD"]["token"]
     bot.run(token)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

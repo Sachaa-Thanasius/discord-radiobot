@@ -2,7 +2,7 @@
     discord-radiobot
     <br>
     <sub>
-        <img src=".github/assets/logo.png" height="300">
+        <img src=".github/assets/logo.png" height="300" alt="Suda Headphones by AeroAli">
     </sub>
 </h1>
 

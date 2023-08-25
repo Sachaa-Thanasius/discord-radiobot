@@ -3,4 +3,3 @@ apsw>=3.42.0.1,<4
 attrs>=23.1.0
 discord.py[voice]>=2.3.2,<3
 wavelink>=2.6.4,<3
-yarl>=1.8.2
