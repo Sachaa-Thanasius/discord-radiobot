@@ -1,7 +1,10 @@
 """Heavily inspired by @mikeshardmind's one-file bots, which may explain if this looks familiar."""
 # TODO: Have a better way to check for DJ roles.
 # TODO: Create a radio_delete command.
+# TODO: Create a station_delete command.
+# TODO: Debug radio_restart command.
 # TODO: Check asyncio.TaskGroup provides any benefit over a for loop + loop.create_task.
+# TODO: Update existing players immediately with new info if possible whenever their radio or current station changes.
 
 from __future__ import annotations
 
@@ -370,7 +373,6 @@ class RadioGroup(app_commands.Group):
             managing_roles=roles,
         )
 
-        # TODO: Update the player immediately with new info if possible.
         if record:
             content = f"Radio with station {record.station.station_name} set in <#{record.channel_id}>."
         else:
@@ -472,7 +474,7 @@ class StationGroup(app_commands.Group):
     @app_commands.command(name="info")
     @app_commands.autocomplete(station_name=station_autocomplete)
     async def station_info(self: Self, itx: discord.Interaction[RadioBot], station_name: str) -> None:
-        """ "Get information about an available 'radio station'.
+        """Get information about an available 'radio station'.
 
         Parameters
         ----------
@@ -541,6 +543,7 @@ async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) 
 
     vc = itx.guild.voice_client
     assert isinstance(vc, RadioPlayer | None)  # Known at runtime.
+
     if vc:
         if volume is None:
             await itx.response.send_message(f"Volume is currently set to {vc.volume}.", ephemeral=True)

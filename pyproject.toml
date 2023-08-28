@@ -3,7 +3,7 @@ line-length = 120
 target-version = ["py311"]
 
 [tool.ruff]
-# Credit to @mikeshardmind for this setup.
+# Credit to @mikeshardmind for most of this setup.
 line-length = 120
 target-version = "py311"
 select = [
@@ -43,16 +43,16 @@ select = [
     "RUF",
 ]
 ignore = [
-    "G002",    # erroneous issue with %-logging when logging can be confiured for % logging 
-    "S101",    # use of assert here is a known quantity, blame typing memes
-    "PLR2004", # Magic value comparison, may remove later
-    "SIM105",  # supressable exception, I'm not paying the overhead of contextlib.supress for stylistic choices.
-    "C90",     # mccabe complexity memes
+    "G002",    # Erroneous issue with %-logging when logging can be configured for % logging.
+    "S101",    # Use of assert here is a known quantity. Blame typing memes.
+    "PLR2004", # Magic value comparison. May remove later.
+    "SIM105",  # Suppressable exception. I'm not paying the overhead of contextlib.supress for stylistic choices.
+    "C90",     # McCabe complexity memes.
     "PLR0913", # More than 5 arguments isn't a problem here.
-    "ANN401",  # Need to type-hint *args and **kwargs with Any
+    "ANN401",  # Need to type-hint *args and **kwargs with Any.
 ]
 unfixable = [
-    "ERA", # I don't want anything erroneously detected deleted by this.
+    "ERA", # Don't want erroneous deletion of comments.
 ]
 
 [tool.ruff.isort]
@@ -61,6 +61,6 @@ combine-as-imports = true
 
 [tool.pyright]
 include = ["radiobot.py"]
-reportMissingTypeStubs = "none"
+reportMissingTypeStubs = "none" # Necessary for Wavelink
 typeCheckingMode = "strict"
 pythonVersion = "3.11"

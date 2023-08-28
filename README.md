@@ -6,6 +6,8 @@
     </sub>
 </h1>
 
-A minimalist Discord bot for setting up radios that play forever.
+A relatively minimal configuration Discord bot for setting up radios that play forever.
+
+Code and organization highly inspired by some of [@mikeshardmind](https://github.com/mikeshardmind)'s one-file Python Discord bots. Much credit to him.
 
 Thank you to [@aeroali](https://github.com/AeroAli/) for the amazing art.
