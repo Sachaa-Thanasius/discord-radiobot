@@ -1,9 +1,6 @@
 """Heavily inspired by @mikeshardmind's one-file bots, which may explain if this looks familiar."""
 # TODO: Have a better way to check for DJ roles.
-# TODO: Create a radio_delete command.
-# TODO: Create a station_delete command.
 # TODO: Debug radio_restart command.
-# TODO: Check asyncio.TaskGroup provides any benefit over a for loop + loop.create_task.
 # TODO: Update existing players immediately with new info if possible whenever their radio or current station changes.
 
 from __future__ import annotations
@@ -12,12 +9,13 @@ import argparse
 import asyncio
 import datetime
 import getpass
+import json
 import logging
 import os
 import re
 from collections.abc import AsyncIterator, Iterable
 from itertools import chain
-from typing import Any, Literal, Self, TypeAlias, cast
+from typing import Any, ClassVar, Literal, Self, TypeAlias, cast
 
 import apsw
 import attrs
@@ -25,6 +23,7 @@ import base2048
 import discord
 import platformdirs
 import wavelink
+import xxhash
 import yarl
 from discord import app_commands
 from discord.ext import tasks
@@ -115,6 +114,22 @@ INSERT_MANAGING_ROLE_STATEMENT = """
 INSERT INTO guild_managing_roles (guild_id, role_id) VALUES (?, ?) ON CONFLICT DO NOTHING;
 """
 
+DELETE_STATION_BY_NAME_STATEMENT = """
+DELETE FROM radio_stations WHERE station_name = ?;
+"""
+
+DELETE_ALL_STATIONS_BY_OWNER_STATEMENT = """
+DELETE FROM radio_stations WHERE owner_id = ?;
+"""
+
+DELETE_RADIO_BY_GUILD_STATEMENT = """
+DELETE FROM radio_stations WHERE station_name = ?;
+"""
+
+
+class NotRadioManager(app_commands.CheckFailure):
+    """An exception raised when the user invoking the command is the local guild's radio manager or "dj"."""
+
 
 @attrs.define
 class StationInfo:
@@ -168,7 +183,17 @@ def _setup_db(conn: apsw.Connection) -> set[int]:
     return set(chain.from_iterable(cursor))
 
 
-def _query(conn: apsw.Connection, query_str: str, params: tuple[int | str, ...]) -> list[tuple[apsw.SQLiteValue, ...]]:
+def _delete(conn: apsw.Connection, query_str: str, params: apsw.Bindings | None = None) -> None:
+    with conn:
+        cursor = conn.cursor()
+        cursor.execute(query_str, params)
+
+
+def _query(
+    conn: apsw.Connection,
+    query_str: str,
+    params: apsw.Bindings | None = None,
+) -> list[tuple[apsw.SQLiteValue, ...]]:
     cursor = conn.cursor()
     return list(cursor.execute(query_str, params))
 
@@ -194,7 +219,7 @@ def _add_radio(
     channel_id: int,
     station_id: int,
     always_shuffle: bool,
-    managing_roles: list[discord.Role] | None,
+    managing_roles: list[discord.Role],
 ) -> GuildRadioInfo | None:
     with conn:
         cursor = conn.cursor()
@@ -294,13 +319,69 @@ async def format_track_embed(embed: discord.Embed, track: AnyTrack) -> discord.E
     return embed
 
 
+class RoleListTransformer(app_commands.Transformer):
+    """Transformer that converts a string into a list of Discord roles."""
+
+    SPLIT_ROLE_IDS_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"(?:<@&|.*?)([0-9]{15,20})(?:>|.*?)")
+
+    async def transform(self: Self, itx: discord.Interaction[RadioBot], value: str) -> list[discord.Role]:
+        if not itx.guild:
+            raise app_commands.NoPrivateMessage
+
+        role_id_matches = self.SPLIT_ROLE_IDS_PATTERN.findall(value)
+        role_list: list[discord.Role] = []
+
+        if role_id_matches:
+            role_list.extend(role for match in role_id_matches if (role := itx.guild.get_role(int(match))))
+        return role_list
+
+
 def convert_list_to_roles(roles_input_str: str, guild: discord.Guild) -> list[discord.Role]:
     split_role_ids_pattern = re.compile(r"(?:<@&|.*?)([0-9]{15,20})(?:>|.*?)")
     matches = split_role_ids_pattern.findall(roles_input_str)
     return [role for match in matches if (role := guild.get_role(int(match)))] if matches else []
 
 
-async def station_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
+async def is_radio_dj(itx: discord.Interaction[RadioBot]) -> bool:
+    """A function that determines if a user has permission to do certain radio-related things based on roles and perms.
+
+    This can be used as an application command check with `@app_commands.check(is_radio_dj)`.
+
+    Parameters
+    ----------
+    itx : discord.Interaction[RadioBot]
+        The interaction that invoked the check.
+
+    Returns
+    -------
+    bool
+        Whether the user has permission to do modify the radio.
+
+    Raises
+    ------
+    NotRadioManager
+        Exception raised when the user doesn't have permission to modify the radio.
+    """
+
+    assert itx.guild
+    assert isinstance(itx.user, discord.Member)
+
+    raw_managing_roles = await asyncio.to_thread(
+        _query,
+        itx.client.db_connection,
+        SELECT_ROLES_BY_GUILD_STATEMENT,
+        (itx.guild.id,),
+    )
+    dj_role_ids = list(chain.from_iterable(raw_managing_roles))
+
+    has_dj_role = any((role.id in dj_role_ids) for role in itx.user.roles)
+    is_server_manager = itx.permissions.manage_guild
+    if not (has_dj_role or is_server_manager):
+        raise NotRadioManager
+    return True
+
+
+async def stations_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
     """Autocomplete callback for all existing stations."""
 
     stations = await itx.client.fetch_all_stations()
@@ -311,7 +392,10 @@ async def station_autocomplete(itx: discord.Interaction[RadioBot], current: str)
     ]
 
 
-async def station_set_autocomplete(itx: discord.Interaction[RadioBot], current: str) -> list[app_commands.Choice[str]]:
+async def owned_stations_autocomplete(
+    itx: discord.Interaction[RadioBot],
+    current: str,
+) -> list[app_commands.Choice[str]]:
     """Autocomplete callback for all stations created by the user."""
 
     stations = await itx.client.fetch_owner_stations(itx.user.id)
@@ -329,14 +413,14 @@ class RadioGroup(app_commands.Group):
         super().__init__(name="radio", guild_only=True, default_permissions=discord.Permissions(manage_guild=True))
 
     @app_commands.command(name="set")
-    @app_commands.autocomplete(station=station_autocomplete)
+    @app_commands.autocomplete(station=stations_autocomplete)
     async def radio_set(
         self: Self,
         itx: discord.Interaction[RadioBot],
         channel: VocalGuildChannel,
         station: str,
         always_shuffle: bool = True,
-        managing_roles: str | None = None,
+        managing_roles: app_commands.Transform[list[discord.Role], RoleListTransformer] | None = None,
     ) -> None:
         """Create or update your server's radio player, specifically its location and what it will play.
 
@@ -358,19 +442,16 @@ class RadioGroup(app_commands.Group):
 
         station_record = await itx.client.fetch_named_station(station)
         if not station_record:
-            await itx.response.send_message(
+            return await itx.response.send_message(
                 "That station doesn't exist. Did you mean to select a different one or make your own?",
             )
-            return
-        stn_id = station_record.station_id
-        roles = convert_list_to_roles(managing_roles, itx.guild) if managing_roles else None
 
         record = await itx.client.save_radio(
             guild_id=itx.guild.id,
             channel_id=channel.id,
-            station_id=stn_id,
+            station_id=station_record.station_id,
             always_shuffle=always_shuffle,
-            managing_roles=roles,
+            managing_roles=managing_roles or [],
         )
 
         if record:
@@ -395,6 +476,15 @@ class RadioGroup(app_commands.Group):
             await itx.response.send_message(embed=local_radio.display_embed())
         else:
             await itx.response.send_message("No radio found for this guild.")
+
+    @app_commands.command(name="delete")
+    async def radio_delete(self: Self, itx: discord.Interaction[RadioBot]) -> None:
+        """Delete the radio for the current guild. May need /restart to be up to date."""
+
+        assert itx.guild_id  # Known quantity in guild-only command.
+
+        await itx.client.delete_radio(itx.guild_id)
+        await itx.response.send_message("If this guild had a radio, it has now been deleted.")
 
     @app_commands.command(name="restart")
     async def radio_restart(self: Self, itx: discord.Interaction[RadioBot]) -> None:
@@ -440,7 +530,7 @@ class StationGroup(app_commands.Group):
         super().__init__(name="station", guild_only=True)
 
     @app_commands.command(name="set")
-    @app_commands.autocomplete(station_name=station_set_autocomplete)
+    @app_commands.autocomplete(station_name=owned_stations_autocomplete)
     async def station_set(
         self: Self,
         itx: discord.Interaction[RadioBot],
@@ -472,7 +562,7 @@ class StationGroup(app_commands.Group):
         await itx.response.send_message(content)
 
     @app_commands.command(name="info")
-    @app_commands.autocomplete(station_name=station_autocomplete)
+    @app_commands.autocomplete(station_name=stations_autocomplete)
     async def station_info(self: Self, itx: discord.Interaction[RadioBot], station_name: str) -> None:
         """Get information about an available 'radio station'.
 
@@ -489,6 +579,25 @@ class StationGroup(app_commands.Group):
             await itx.response.send_message(embed=station_record.display_embed(), ephemeral=True)
         else:
             await itx.response.send_message("No such station found.")
+
+    @app_commands.command(name="delete")
+    @app_commands.autocomplete(station_name=owned_stations_autocomplete)
+    async def station_delete(self: Self, itx: discord.Interaction[RadioBot], station_name: str) -> None:
+        """Delete a radio station, but only if you're the owner of it.
+
+        Parameters
+        ----------
+        itx : discord.Interaction[RadioBot]
+            The interaction that triggered this command.
+        station_name : str
+            The name of the station you're looking for.
+        """
+
+        station_record = await itx.client.fetch_named_station(station_name)
+        if station_record and station_record.owner_id == itx.user.id:
+            await itx.client.delete_station(station_name)
+        else:
+            await itx.response.send_message("Either that station doesn't exist or you don't own it.")
 
 
 @app_commands.command()
@@ -554,7 +663,7 @@ async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) 
                 SELECT_ROLES_BY_GUILD_STATEMENT,
                 (itx.guild.id,),
             )
-            dj_role_ids = [result[1] for result in raw_results] if raw_results else None
+            dj_role_ids = [result[0] for result in raw_results] if raw_results else None
 
             if (not dj_role_ids) or any((role.id in dj_role_ids) for role in itx.user.roles):
                 await vc.set_volume(volume)
@@ -621,6 +730,51 @@ class RadioPlayer(wavelink.Player):
         return self.radio_info.station
 
 
+class VersionableTree(app_commands.CommandTree):
+    """A command tree with a two new methods:
+
+    1. Generates a unique hash to represent all commands currently in the tree.
+    2. Compare hash of the current tree against that of a previous version using the above method.
+
+    Notes
+    -----
+    The main use case is autosyncing using the hash comparison as a condition.
+    """
+
+    async def get_hash(self: Self) -> bytes:
+        commands = sorted(self._get_all_commands(guild=None), key=lambda c: c.qualified_name)
+
+        translator = self.translator
+        if translator:
+            payload = [await command.get_translated_payload(translator) for command in commands]
+        else:
+            payload = [command.to_dict() for command in commands]
+
+        return xxhash.xxh3_64_digest(json.dumps(payload).encode("utf-8"), seed=0)
+
+    async def sync_if_commands_updated(self: Self) -> None:
+        """Sync the tree globally if its commands are different from the tree's most recent previous version.
+
+        Comparison is done with hashes, with the hash being stored in a specific file if unique for later comparison.
+
+        Notes
+        -----
+        This uses blocking file IO, so don't run this in situations where that matters. `setup_hook()` should be fine
+        a fine place though.
+        """
+
+        tree_hash = await self.get_hash()
+        cache_path = platformdir_info.user_cache_path
+        cache_path.mkdir(parents=True, exist_ok=True)
+        tree_hash_path = cache_path / "tree.hash"
+        with tree_hash_path.open("w+b") as fp:
+            data = fp.read()
+            if data != tree_hash:
+                await self.sync()
+                fp.seek(0)
+                fp.write(tree_hash)
+
+
 class RadioBot(discord.AutoShardedClient):
     """The Discord client subclass that provides radio-related functionality.
 
@@ -644,7 +798,7 @@ class RadioBot(discord.AutoShardedClient):
             activity=discord.Game(name="https://github.com/Sachaa-Thanasius/discord-radiobot"),
         )
 
-        self.tree = app_commands.CommandTree(self)
+        self.tree = VersionableTree(self)
 
         # Connect to the database that will store the radio information.
         # -- Need to account for the directories and/or file not existing.
@@ -674,12 +828,12 @@ class RadioBot(discord.AutoShardedClient):
         self._radio_enabled_guilds: set[int] = await asyncio.to_thread(_setup_db, self.db_connection)
         self.radio_loop.start()
 
-        # Add the app commands to the tree and sync it.
+        # Add the app commands to the tree.
         for cmd in APP_COMMANDS:
             self.tree.add_command(cmd)
 
-        # In production, this should rarely run, so it's probably fine to automate it.
-        await self.tree.sync()
+        # Sync the tree if it's different from the previous version, using hashing for comparison.
+        await self.tree.sync_if_commands_updated()
 
     async def close(self: Self) -> None:
         self.radio_loop.cancel()
@@ -767,9 +921,8 @@ class RadioBot(discord.AutoShardedClient):
             [(guild.id,) for guild in inactive_radio_guilds],
         )
 
-        async with asyncio.TaskGroup() as tg:
-            for radio in radio_results:
-                tg.create_task(self.start_guild_radio(radio))
+        for radio in radio_results:
+            self.loop.create_task(self.start_guild_radio(radio))
 
     @radio_loop.before_loop
     async def radio_loop_before(self: Self) -> None:
@@ -835,7 +988,7 @@ class RadioBot(discord.AutoShardedClient):
         channel_id: int,
         station_id: int,
         always_shuffle: bool,
-        managing_roles: list[discord.Role] | None,
+        managing_roles: list[discord.Role],
     ) -> GuildRadioInfo | None:
         """Create or update a radio.
 
@@ -869,6 +1022,39 @@ class RadioBot(discord.AutoShardedClient):
             always_shuffle=always_shuffle,
             managing_roles=managing_roles,
         )
+
+    async def delete_station(self: Self, station_name: str) -> None:
+        """Delete a station by name.
+
+        Parameters
+        ----------
+        station_name : str
+            The name of the station being deleted.
+        """
+
+        await asyncio.to_thread(_delete, self.db_connection, DELETE_STATION_BY_NAME_STATEMENT, (station_name,))
+
+    async def delete_owner_stations(self: Self, owner_id: int) -> None:
+        """Delete all stations belong to a particular person.
+
+        Parameters
+        ----------
+        owner_id : int
+            The Discord ID of the station owner.
+        """
+
+        await asyncio.to_thread(_delete, self.db_connection, DELETE_ALL_STATIONS_BY_OWNER_STATEMENT, (owner_id,))
+
+    async def delete_radio(self: Self, guild_id: int) -> None:
+        """Delete a guild's radio.
+
+        Parameters
+        ----------
+        guild_id : int
+            The Discord ID of the guild.
+        """
+
+        await asyncio.to_thread(_delete, self.db_connection, DELETE_RADIO_BY_GUILD_STATEMENT, (guild_id,))
 
 
 def _get_stored_token() -> str | None:
