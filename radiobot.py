@@ -324,22 +324,12 @@ class RoleListTransformer(app_commands.Transformer):
 
     SPLIT_ROLE_IDS_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r"(?:<@&|.*?)([0-9]{15,20})(?:>|.*?)")
 
-    async def transform(self: Self, itx: discord.Interaction[RadioBot], value: str) -> list[discord.Role]:
+    async def transform(self: Self, itx: discord.Interaction[Any], value: str) -> list[discord.Role]:
         if not itx.guild:
             raise app_commands.NoPrivateMessage
 
-        role_id_matches = self.SPLIT_ROLE_IDS_PATTERN.findall(value)
-        role_list: list[discord.Role] = []
-
-        if role_id_matches:
-            role_list.extend(role for match in role_id_matches if (role := itx.guild.get_role(int(match))))
-        return role_list
-
-
-def convert_list_to_roles(roles_input_str: str, guild: discord.Guild) -> list[discord.Role]:
-    split_role_ids_pattern = re.compile(r"(?:<@&|.*?)([0-9]{15,20})(?:>|.*?)")
-    matches = split_role_ids_pattern.findall(roles_input_str)
-    return [role for match in matches if (role := guild.get_role(int(match)))] if matches else []
+        role_id_matches = self.SPLIT_ROLE_IDS_PATTERN.finditer(value)
+        return [role for match in role_id_matches if (role := itx.guild.get_role(int(match.group())))]
 
 
 async def is_radio_dj(itx: discord.Interaction[RadioBot]) -> bool:
@@ -435,16 +425,18 @@ class RadioGroup(app_commands.Group):
         always_shuffle : bool, optional
             Whether the station should shuffle its internal playlist whenever it loops. By default True.
         managing_roles : str | None, optional
-            The roles with enhanced server radio permissions. Comma-separated list if more than one. By default, None.
+            The roles with enhanced server radio permissions. Comma-separated list of mentions if more than one.
+            By default, None.
         """
 
         assert itx.guild  # Known quantity in guild-only command.
 
         station_record = await itx.client.fetch_named_station(station)
         if not station_record:
-            return await itx.response.send_message(
+            await itx.response.send_message(
                 "That station doesn't exist. Did you mean to select a different one or make your own?",
             )
+            return
 
         record = await itx.client.save_radio(
             guild_id=itx.guild.id,
