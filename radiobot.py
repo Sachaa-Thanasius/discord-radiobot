@@ -1,5 +1,4 @@
 """Heavily inspired by @mikeshardmind's one-file bots, which may explain if this looks familiar."""
-# TODO: Debug radio_restart command.
 
 from __future__ import annotations
 
@@ -27,6 +26,12 @@ import yarl
 from discord import app_commands
 from discord.ext import tasks
 from wavelink.ext import spotify
+
+
+try:
+    import uvloop  # type: ignore
+except ModuleNotFoundError:
+    uvloop = None
 
 
 # This turns on WAL mode, logging, and a few other things.
@@ -284,6 +289,7 @@ async def radio_delete(itx: discord.Interaction[RadioBot]) -> None:
     """Delete the radio for the current guild. May need /restart to be up to date."""
 
     assert itx.guild_id  # Known quantity in guild-only command.
+
     await itx.client.delete_radio(itx.guild_id)
     await itx.response.send_message("If this guild had a radio, it has now been deleted.")
 
@@ -580,7 +586,7 @@ class RadioBot(discord.AutoShardedClient):
         """
 
         player = payload.player
-        assert isinstance(player, RadioPlayer)
+        assert isinstance(player, RadioPlayer)  # Known at runtime.
 
         if player.is_connected():
             queue_length_before = len(player.queue)
@@ -629,8 +635,8 @@ class RadioBot(discord.AutoShardedClient):
         It (re)connects voice clients to voice channels and plays preset stations.
         """
 
-        inactive_radio_guilds = [
-            guild
+        inactive_radio_guild_ids = [
+            guild_id
             for guild_id in self._radio_enabled_guilds
             if (guild := self.get_guild(guild_id)) and not guild.voice_client
         ]
@@ -638,7 +644,7 @@ class RadioBot(discord.AutoShardedClient):
         radio_results = await asyncio.to_thread(
             _query,
             self.db_connection,
-            [(guild.id,) for guild in inactive_radio_guilds],
+            [(guild_id,) for guild_id in inactive_radio_guild_ids],
         )
 
         for radio in radio_results:
@@ -808,27 +814,12 @@ def _get_spotify_creds() -> dict[str, str] | None:
     return spotify_creds
 
 
-def setup_logging() -> None:
-    root_log = logging.getLogger()
-
-    # Set up some other logging.
-    logging.getLogger("wavelink").setLevel(logging.INFO)
-    logging.getLogger("discord").setLevel(logging.INFO)
-    logging.getLogger("discord.http").setLevel(logging.INFO)
-    root_log.setLevel(logging.INFO)
-
-    handler = logging.StreamHandler()
-    if discord.utils.stream_supports_colour(handler):
-        fmt = discord.utils._ColourFormatter()  # pyright: ignore [reportPrivateUsage]
-    else:
-        dt_fmt = "%Y-%m-%d %H:%M:%S"
-        fmt = logging.Formatter("[{asctime}] [{levelname:<8}] {name}: {message}", dt_fmt, style="{")
-    handler.setFormatter(fmt)
-    root_log.addHandler(handler)
-
-
 def run_client() -> None:
     """Confirm existence of required credentials and launch the radio bot."""
+
+    async def bot_runner(client: RadioBot) -> None:
+        async with client:
+            await client.start(token, reconnect=True)
 
     token = _get_token()
     lavalink_creds = _get_lavalink_creds()
@@ -839,7 +830,10 @@ def run_client() -> None:
         config["SPOTIFY"] = spotify_creds
 
     client = RadioBot(config)
-    client.run(token, log_handler=None)
+
+    loop = uvloop.new_event_loop if (uvloop is not None) else None  # type: ignore
+    with asyncio.Runner(loop_factory=loop) as runner:  # type: ignore
+        runner.run(bot_runner(client))
 
 
 def main() -> None:
@@ -885,5 +879,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    setup_logging()
     raise SystemExit(main())
