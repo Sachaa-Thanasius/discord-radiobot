@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import datetime
 import functools
 import getpass
 import json
 import logging
 import os
 from collections.abc import AsyncIterator, Iterable
+from datetime import timedelta
 from itertools import chain
+from pathlib import Path
 from typing import Any, Literal, Self, TypeAlias, cast
 
 import apsw
@@ -23,7 +24,6 @@ import platformdirs
 import wavelink
 import xxhash
 import yarl
-from discord import app_commands
 from discord.ext import tasks
 from wavelink.ext import spotify
 
@@ -33,19 +33,26 @@ try:
 except ModuleNotFoundError:
     uvloop = None
 
-
-# This turns on WAL mode, logging, and a few other things.
-apsw.bestpractice.apply(apsw.bestpractice.recommended)  # type: ignore
-
 RadioInfoTuple: TypeAlias = tuple[int, int, str, int]
 AnyTrack: TypeAlias = wavelink.Playable | spotify.SpotifyTrack
 AnyTrackIterable: TypeAlias = list[wavelink.Playable] | list[spotify.SpotifyTrack] | spotify.SpotifyAsyncIterator
 
+# Set up logging.
+apsw.bestpractice.apply(apsw.bestpractice.recommended)  # type: ignore # SQLite WAL mode, logging, and other things.
+discord.utils.setup_logging()
 log = logging.getLogger(__name__)
-platformdir_info = platformdirs.PlatformDirs("discord-radiobot", "Sachaa-Thanasius", roaming=False)
 
+platformdir_info = platformdirs.PlatformDirs("discord-radiobot", "Sachaa-Thanasius", roaming=False)
 escape_markdown = functools.partial(discord.utils.escape_markdown, as_needed=True)
 
+MUSIC_EMOJIS: dict[type[AnyTrack], str] = {
+    wavelink.YouTubeTrack: "<:youtube:1108460195270631537>",
+    wavelink.YouTubeMusicTrack: "<:youtubemusic:954046930713985074>",
+    wavelink.SoundCloudTrack: "<:soundcloud:1147265178505846804>",
+    spotify.SpotifyTrack: "<:spotify:1108458132826501140>",
+}
+
+SPOTIFY_URL = "https://open.spotify.com/track/{}"
 
 INITIALIZATION_STATEMENTS = """
 CREATE TABLE IF NOT EXISTS guild_radios (
@@ -80,7 +87,7 @@ DELETE FROM guild_radios WHERE guild_id = ?;
 """
 
 
-@attrs.define
+@attrs.frozen
 class GuildRadioInfo:
     guild_id: int
     channel_id: int
@@ -92,6 +99,7 @@ class GuildRadioInfo:
         guild_id, channel_id, station_link, always_shuffle = row
         return cls(guild_id, channel_id, station_link, bool(always_shuffle))
 
+    @functools.cached_property
     def display_embed(self: Self) -> discord.Embed:
         """Format the radio's information into a Discord embed."""
 
@@ -136,6 +144,251 @@ def _add_radio(
         # Throws an BusyError if not done in a similar way.
         rows = list(cursor)
         return GuildRadioInfo.from_row(rows[0]) if rows[0] else None
+
+
+def resolve_path_with_links(path: Path, folder: bool = False) -> Path:
+    """Resolve a path strictly with more secure default permissions, creating the path if necessary.
+
+    Python only resolves with strict=True if the path exists.
+
+    Source: https://github.com/mikeshardmind/discord-rolebot/blob/4374149bc75d5a0768d219101b4dc7bff3b9e38e/rolebot.py#L350
+    """
+
+    try:
+        return path.resolve(strict=True)
+    except FileNotFoundError:
+        path = resolve_path_with_links(path.parent, folder=True) / path.name
+        if folder:
+            path.mkdir(mode=0o700)  # python's default is world read/write/traversable... (0o777)
+        else:
+            path.touch(mode=0o600)  # python's default is world read/writable... (0o666)
+        return path.resolve(strict=True)
+
+
+async def format_track_embed(embed: discord.Embed, track: AnyTrack) -> discord.Embed:
+    """Modify an embed to show information about a Wavelink track."""
+
+    icon = MUSIC_EMOJIS.get(type(track), "\N{MUSICAL NOTE}")
+    embed.title = f"{icon} {(embed.title or '')}"
+    description_template = "[{0}]({1})\n{2}\n`[0:00-{3}]`"
+
+    try:
+        end_time = timedelta(seconds=track.duration // 1000)
+    except OverflowError:
+        end_time = "\N{INFINITY}"
+
+    if isinstance(track, wavelink.Playable):
+        uri = track.uri or ""
+        author = escape_markdown(track.author) if track.author else ""
+    else:
+        uri = SPOTIFY_URL.format(track.uri.rpartition(":")[2])
+        author = escape_markdown(", ".join(track.artists))
+
+    title = escape_markdown(track.title)
+    embed.description = description_template.format(title, uri, author, end_time)
+
+    if isinstance(track, wavelink.YouTubeTrack):
+        thumbnail = await track.fetch_thumbnail()
+        embed.set_thumbnail(url=thumbnail)
+
+    return embed
+
+
+@discord.app_commands.command()
+@discord.app_commands.guild_only()
+@discord.app_commands.default_permissions(manage_guild=True)
+async def radio_set(
+    itx: discord.Interaction[RadioBot],
+    channel: discord.VoiceChannel | discord.StageChannel,
+    station_link: str,
+    always_shuffle: bool = True,
+) -> None:
+    """Create or update your server's radio player, specifically its location and what it will play.
+
+    Parameters
+    ----------
+    itx : discord.Interaction[RadioBot]
+        The interaction that triggered this command.
+    channel : discord.VoiceChannel | discord.StageChannel
+        The channel the radio should automatically play in and, if necessary, reconnect to.
+    station_link : str
+        The 'radio station' you want to play in your server, e.g. a link to a playlist/audio stream.
+    always_shuffle : bool, optional
+        Whether the station should shuffle its internal playlist whenever it loops. By default True.
+    """
+
+    assert itx.guild  # Known quantity in guild-only command.
+
+    record = await itx.client.save_radio(
+        guild_id=itx.guild.id,
+        channel_id=channel.id,
+        station_link=station_link,
+        always_shuffle=always_shuffle,
+    )
+
+    if record:
+        content = f"Radio with station {record.station_link} set in <#{record.channel_id}>."
+    else:
+        content = f"Unable to set radio in {channel.mention} with [this station]({station_link}) at this time."
+    await itx.response.send_message(content)
+
+
+@discord.app_commands.command()
+@discord.app_commands.guild_only()
+async def radio_get(itx: discord.Interaction[RadioBot]) -> None:
+    """Get information about your server's current radio setup. May need /restart to be up to date."""
+
+    assert itx.guild_id  # Known quantity in guild-only command.
+
+    local_radio_results = await asyncio.to_thread(_query, itx.client.db_connection, [(itx.guild_id,)])
+
+    if local_radio_results and (local_radio := local_radio_results[0]):
+        await itx.response.send_message(embed=local_radio.display_embed)
+    else:
+        await itx.response.send_message("No radio found for this guild.")
+
+
+@discord.app_commands.command()
+@discord.app_commands.guild_only()
+@discord.app_commands.default_permissions(manage_guild=True)
+async def radio_delete(itx: discord.Interaction[RadioBot]) -> None:
+    """Delete the radio for the current guild. May need /restart to be up to date."""
+
+    assert itx.guild_id  # Known quantity in guild-only command.
+
+    await itx.client.delete_radio(itx.guild_id)
+    await itx.response.send_message("If this guild had a radio, it has now been deleted.")
+
+
+@discord.app_commands.command()
+@discord.app_commands.guild_only()
+@discord.app_commands.default_permissions(manage_guild=True)
+async def radio_restart(itx: discord.Interaction[RadioBot]) -> None:
+    """Restart your server's radio. Acts as a reset in case you change something."""
+
+    assert itx.guild  # Known quantity in guild-only command.
+
+    if vc := itx.guild.voice_client:
+        await vc.disconnect(force=True)
+
+    guild_radio_records = await asyncio.to_thread(_query, itx.client.db_connection, [(itx.guild.id,)])
+
+    if guild_radio_records:
+        await itx.response.send_message("Restarting radio now. Give it a few seconds to rejoin.")
+    else:
+        await itx.response.send_message("This server's radio does not exist. Not restarting.")
+
+
+@discord.app_commands.command()
+@discord.app_commands.guild_only()
+@discord.app_commands.default_permissions(manage_guild=True)
+async def radio_next(itx: discord.Interaction[RadioBot]) -> None:
+    """Skip to the next track. If managing roles are set, only members with those can use this command."""
+
+    assert itx.guild  # Known quantity in guild-only command.
+
+    vc = itx.guild.voice_client
+    assert isinstance(vc, RadioPlayer | None)  # Known at runtime.
+
+    if vc:
+        await vc.stop()
+        await itx.response.send_message("Skipping to next track.")
+    else:
+        await itx.response.send_message("No radio currently active in this server.")
+
+
+@discord.app_commands.command()
+@discord.app_commands.guild_only()
+async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "radio"] = "track") -> None:
+    """See what's currently playing on the radio.
+
+    Parameters
+    ----------
+    itx : discord.Interaction[RadioBot]
+        The interaction that triggered this command.
+    level : Literal["track", "station", "radio"], optional
+        What to get information about: the currently playing track, station, or radio. By default, "track".
+    """
+
+    assert itx.guild  # Known quantity in guild-only command.
+
+    vc = itx.guild.voice_client
+    assert isinstance(vc, RadioPlayer | None)  # Known at runtime.
+
+    if vc:
+        if level == "track":
+            if vc.current:
+                embed = await format_track_embed(discord.Embed(color=0x0389DA, title="Currently Playing"), vc.current)
+                if original := vc.current_original:
+                    spotify_url = SPOTIFY_URL.format(original.uri.rpartition(":")[2])
+                    embed.add_field(name="Spotify Source", value=f"[Link]({spotify_url})")
+            else:
+                embed = discord.Embed(description="Nothing is currently playing.")
+        else:
+            embed = vc.radio_info.display_embed
+        await itx.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await itx.response.send_message("No radio currently active in this server.")
+
+
+@discord.app_commands.command()
+@discord.app_commands.guild_only()
+async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) -> None:
+    """See or change the volume of the radio.
+
+    Parameters
+    ----------
+    itx : discord.Interaction[RadioBot]
+        The interaction that triggered this command.
+    volume : int | None, optional
+        What to change the volume to, between 1 and 1000. Locked to managing roles if those are set. By default, None.
+    """
+
+    # Known quantities in guild-only command.
+    assert itx.guild
+    assert isinstance(itx.user, discord.Member)
+
+    vc = itx.guild.voice_client
+    assert isinstance(vc, RadioPlayer | None)  # Known at runtime.
+
+    if vc:
+        if volume is None:
+            await itx.response.send_message(f"Volume is currently set to {vc.volume}.", ephemeral=True)
+        else:
+            await vc.set_volume(volume)
+            await itx.response.send_message(f"Volume now changed to {vc.volume}.")
+    else:
+        await itx.response.send_message("No radio currently active in this server.")
+
+
+@discord.app_commands.command()
+@discord.app_commands.guild_only()
+async def invite(itx: discord.Interaction[RadioBot]) -> None:
+    """Get a link to invite this bot to a server."""
+
+    embed = discord.Embed(description="Click the link below to invite me to one of your servers.")
+    view = discord.ui.View().add_item(discord.ui.Button(label="Invite", url=itx.client.invite_link))
+    await itx.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+@discord.app_commands.command(name="help")
+@discord.app_commands.guild_only()
+async def help_(itx: discord.Interaction[RadioBot]) -> None:
+    """Basic instructions for setting up your radio."""
+
+    description = (
+        "1. Create the radio for your server with `/radio_set`, using an audio streaming–capable URL "  # noqa: RUF001
+        "for the 'station'.\n"
+        " - If you want to edit the radio, use the same command. It will require reentering the channel, though.\n"
+        "2. The bot should join the channel specified and begin playing shortly!\n\n"
+        "`/radio_delete`, `/radio_restart`, and `/radio_next` are restricted by default. To change those usage "
+        "permissions, use your server's Integration settings."
+    )
+    embed = discord.Embed(description=description)
+    await itx.response.send_message(embed=embed)
+
+
+APP_COMMANDS = [radio_set, radio_get, radio_delete, radio_restart, radio_next, current, volume, invite, help_]
 
 
 class WavelinkTrackConverter:
@@ -201,227 +454,6 @@ class WavelinkTrackConverter:
         return tracks
 
 
-async def format_track_embed(embed: discord.Embed, track: AnyTrack) -> discord.Embed:
-    """Modify an embed to show information about a Wavelink track."""
-
-    description_template = "[{0}]({1})\n{2}\n`[0:00-{3}]`"
-
-    try:
-        end_time = datetime.timedelta(seconds=track.duration // 1000)
-    except OverflowError:
-        end_time = "\N{INFINITY}"
-
-    if isinstance(track, wavelink.Playable):
-        uri = track.uri or ""
-        author = escape_markdown(track.author) if track.author else ""
-    else:
-        uri = f"https://open.spotify.com/track/{track.uri.rpartition(':')[2]}"
-        author = escape_markdown(", ".join(track.artists))
-
-    title = escape_markdown(track.title)
-    embed.description = description_template.format(title, uri, author, end_time)
-
-    if isinstance(track, wavelink.YouTubeTrack):
-        thumbnail = await track.fetch_thumbnail()
-        embed.set_thumbnail(url=thumbnail)
-
-    return embed
-
-
-@app_commands.command()
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-async def radio_set(
-    itx: discord.Interaction[RadioBot],
-    channel: discord.VoiceChannel | discord.StageChannel,
-    station_link: str,
-    always_shuffle: bool = True,
-) -> None:
-    """Create or update your server's radio player, specifically its location and what it will play.
-
-    Parameters
-    ----------
-    itx : discord.Interaction[RadioBot]
-        The interaction that triggered this command.
-    channel : discord.VoiceChannel | discord.StageChannel
-        The channel the radio should automatically play in and, if necessary, reconnect to.
-    station_link : str
-        The 'radio station' you want to play in your server, e.g. a link to a playlist/audio stream.
-    always_shuffle : bool, optional
-        Whether the station should shuffle its internal playlist whenever it loops. By default True.
-    """
-
-    assert itx.guild  # Known quantity in guild-only command.
-
-    record = await itx.client.save_radio(
-        guild_id=itx.guild.id,
-        channel_id=channel.id,
-        station_link=station_link,
-        always_shuffle=always_shuffle,
-    )
-
-    if record:
-        content = f"Radio with station {record.station_link} set in <#{record.channel_id}>."
-    else:
-        content = f"Unable to set radio in {channel.mention} with [this station]({station_link}) at this time."
-    await itx.response.send_message(content)
-
-
-@app_commands.command()
-@app_commands.guild_only()
-async def radio_get(itx: discord.Interaction[RadioBot]) -> None:
-    """Get information about your server's current radio setup. May need /restart to be up to date."""
-
-    assert itx.guild_id  # Known quantity in guild-only command.
-
-    local_radio_results = await asyncio.to_thread(_query, itx.client.db_connection, [(itx.guild_id,)])
-
-    if local_radio_results and (local_radio := local_radio_results[0]):
-        await itx.response.send_message(embed=local_radio.display_embed())
-    else:
-        await itx.response.send_message("No radio found for this guild.")
-
-
-@app_commands.command()
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-async def radio_delete(itx: discord.Interaction[RadioBot]) -> None:
-    """Delete the radio for the current guild. May need /restart to be up to date."""
-
-    assert itx.guild_id  # Known quantity in guild-only command.
-
-    await itx.client.delete_radio(itx.guild_id)
-    await itx.response.send_message("If this guild had a radio, it has now been deleted.")
-
-
-@app_commands.command()
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-async def radio_restart(itx: discord.Interaction[RadioBot]) -> None:
-    """Restart your server's radio. Acts as a reset in case you change something."""
-
-    assert itx.guild  # Known quantity in guild-only command.
-
-    if vc := itx.guild.voice_client:
-        await vc.disconnect(force=True)
-
-    guild_radio_records = await asyncio.to_thread(_query, itx.client.db_connection, [(itx.guild.id,)])
-
-    if guild_radio_records:
-        await itx.response.send_message("Restarting radio now. Give it a few seconds to rejoin.")
-    else:
-        await itx.response.send_message("This server's radio does not exist. Not restarting.")
-
-
-@app_commands.command()
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-async def radio_next(itx: discord.Interaction[RadioBot]) -> None:
-    """Skip to the next track. If managing roles are set, only members with those can use this command."""
-
-    assert itx.guild  # Known quantity in guild-only command.
-
-    vc = itx.guild.voice_client
-    assert isinstance(vc, RadioPlayer | None)  # Known at runtime.
-
-    if vc:
-        await vc.stop()
-        await itx.response.send_message("Skipping to next track.")
-    else:
-        await itx.response.send_message("No radio currently active in this server.")
-
-
-@app_commands.command()
-@app_commands.guild_only()
-async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "radio"] = "track") -> None:
-    """See what's currently playing on the radio.
-
-    Parameters
-    ----------
-    itx : discord.Interaction[RadioBot]
-        The interaction that triggered this command.
-    level : Literal["track", "station", "radio"], optional
-        What to get information about: the currently playing track, station, or radio. By default, "track".
-    """
-
-    assert itx.guild  # Known quantity in guild-only command.
-
-    vc = itx.guild.voice_client
-    assert isinstance(vc, RadioPlayer | None)  # Known at runtime.
-
-    if vc:
-        if level == "track":
-            if vc.current:
-                embed = await format_track_embed(discord.Embed(color=0x0389DA, title="Currently Playing"), vc.current)
-            else:
-                embed = discord.Embed(description="Nothing is currently playing.")
-        else:
-            embed = vc.radio_info.display_embed()
-        await itx.response.send_message(embed=embed, ephemeral=True)
-    else:
-        await itx.response.send_message("No radio currently active in this server.")
-
-
-@app_commands.command()
-@app_commands.guild_only()
-async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) -> None:
-    """See or change the volume of the radio.
-
-    Parameters
-    ----------
-    itx : discord.Interaction[RadioBot]
-        The interaction that triggered this command.
-    volume : int | None, optional
-        What to change the volume to, between 1 and 1000. Locked to managing roles if those are set. By default, None.
-    """
-
-    # Known quantities in guild-only command.
-    assert itx.guild
-    assert isinstance(itx.user, discord.Member)
-
-    vc = itx.guild.voice_client
-    assert isinstance(vc, RadioPlayer | None)  # Known at runtime.
-
-    if vc:
-        if volume is None:
-            await itx.response.send_message(f"Volume is currently set to {vc.volume}.", ephemeral=True)
-        else:
-            await vc.set_volume(volume)
-            await itx.response.send_message(f"Volume now changed to {vc.volume}.")
-    else:
-        await itx.response.send_message("No radio currently active in this server.")
-
-
-@app_commands.command()
-@app_commands.guild_only()
-async def invite(itx: discord.Interaction[RadioBot]) -> None:
-    """Get a link to invite this bot to a server."""
-
-    embed = discord.Embed(description="Click the link below to invite me to one of your servers.")
-    view = discord.ui.View().add_item(discord.ui.Button(label="Invite", url=itx.client.invite_link))
-    await itx.response.send_message(embed=embed, view=view, ephemeral=True)
-
-
-@app_commands.command(name="help")
-@app_commands.guild_only()
-async def help_(itx: discord.Interaction[RadioBot]) -> None:
-    """Basic instructions for setting up your radio."""
-
-    description = (
-        "1. Create the radio for your server with `/radio_set`, using an audio streaming–capable URL "  # noqa: RUF001
-        "for the 'station'.\n"
-        " - If you want to edit the radio, use the same command. It will require reentering the channel, though.\n"
-        "2. The bot should join the channel specified and begin playing shortly!\n\n"
-        "`/radio_delete`, `/radio_restart`, and `/radio_next` are restricted by default. To change those usage "
-        "permissions, use your server's Integration settings."
-    )
-    embed = discord.Embed(description=description)
-    await itx.response.send_message(embed=embed)
-
-
-APP_COMMANDS = [radio_set, radio_get, radio_delete, radio_restart, radio_next, current, volume, invite, help_]
-
-
 class RadioQueue(wavelink.Queue):
     async def put_iterable_wait(self: Self, tracks: AnyTrack | AnyTrackIterable) -> None:
         """Put items from an iterable into the queue asynchronously using await."""
@@ -445,9 +477,17 @@ class RadioPlayer(wavelink.Player):
     radio_info
     """
 
-    def __init__(self: Self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self: Self,
+        client: discord.Client = discord.utils.MISSING,
+        channel: discord.VoiceChannel | discord.StageChannel = discord.utils.MISSING,
+        *,
+        nodes: list[wavelink.Node] | None = None,
+        swap_node_on_disconnect: bool = True,
+    ) -> None:
+        super().__init__(client, channel, nodes=nodes, swap_node_on_disconnect=swap_node_on_disconnect)
         self.queue: RadioQueue = RadioQueue()
+        self._current_original: spotify.SpotifyTrack | None = None
 
     @property
     def radio_info(self: Self) -> GuildRadioInfo:
@@ -459,7 +499,29 @@ class RadioPlayer(wavelink.Player):
     def radio_info(self: Self, value: GuildRadioInfo) -> None:
         self._radio_info = value
 
+    @property
+    def current_original(self: Self) -> spotify.SpotifyTrack | None:
+        """`spotify.SpotifyTrack | None`: If the current track is from Spotify, this will have the original metadata."""
+
+        return self._current_original
+
+    async def play(
+        self: Self,
+        track: AnyTrack,
+        replace: bool = True,
+        start: int | None = None,
+        end: int | None = None,
+        volume: int | None = None,
+        *,
+        populate: bool = False,
+    ) -> wavelink.Playable:
+        # Only for capturing the original Spotify track.
+        self._current_original = track if isinstance(track, spotify.SpotifyTrack) else None
+        return await super().play(track, replace, start, end, volume, populate=populate)
+
     async def regenerate_radio_queue(self: Self) -> None:
+        """Recreate the queue based on the track link in the player's radio info."""
+
         self.queue.clear()
         converted = await WavelinkTrackConverter.convert(self.radio_info.station_link)
         await self.queue.put_iterable_wait(converted)
@@ -468,11 +530,13 @@ class RadioPlayer(wavelink.Player):
             self.queue.shuffle()
 
 
-class VersionableTree(app_commands.CommandTree):
+class VersionableTree(discord.app_commands.CommandTree):
     """A command tree with a two new methods:
 
     1. Generate a unique hash to represent all commands currently in the tree.
     2. Compare hash of the current tree against that of a previous version using the above method.
+
+    Credit to @mikeshardmind: Everything in this class is his.
 
     Notes
     -----
@@ -502,11 +566,9 @@ class VersionableTree(app_commands.CommandTree):
         """
 
         tree_hash = await self.get_hash()
-        cache_path = platformdir_info.user_cache_path
-        cache_path.mkdir(parents=True, exist_ok=True)
-        tree_hash_path = cache_path / "tree.hash"
-        with tree_hash_path.open("a+b") as fp:
-            fp.seek(0)
+        tree_hash_path = platformdir_info.user_cache_path / "tree.hash"
+        tree_hash_path = resolve_path_with_links(tree_hash_path)
+        with tree_hash_path.open("r+b") as fp:
             data = fp.read()
             if data != tree_hash:
                 log.info("New version of the command tree. Syncing now.")
@@ -542,10 +604,8 @@ class RadioBot(discord.AutoShardedClient):
 
         # Connect to the database that will store the radio information.
         # -- Need to account for the directories and/or file not existing.
-        data_path = platformdir_info.user_data_path
-        data_path.mkdir(parents=True, exist_ok=True)
-        db_path = data_path / "radiobot_data.db"
-        resolved_path_as_str = str(db_path.resolve())
+        db_path = platformdir_info.user_data_path / "radiobot_data.db"
+        resolved_path_as_str = str(resolve_path_with_links(db_path))
         self.db_connection = apsw.Connection(resolved_path_as_str)
 
     async def on_connect(self: Self) -> None:
@@ -621,7 +681,7 @@ class RadioBot(discord.AutoShardedClient):
         assert isinstance(voice_channel, discord.VoiceChannel | discord.StageChannel)
 
         # This player should be compatible with discord.py's connect.
-        vc = await voice_channel.connect(cls=RadioPlayer)
+        vc = await voice_channel.connect(cls=RadioPlayer)  # type: ignore
         vc.radio_info = radio_info
 
         # Get the playlist of the guild's registered radio station and play it on loop.
@@ -719,18 +779,17 @@ class RadioBot(discord.AutoShardedClient):
 
 def _get_stored_credentials(filename: str) -> tuple[str, ...] | None:
     secret_file_path = platformdir_info.user_config_path / filename
-    if secret_file_path.exists():
-        with secret_file_path.open("r", encoding="utf-8") as fp:
-            return tuple(base2048.decode(line.removesuffix("\n")).decode("utf-8") for line in fp.readlines())
-    return None
+    secret_file_path = resolve_path_with_links(secret_file_path)
+    with secret_file_path.open("r", encoding="utf-8") as fp:
+        return tuple(base2048.decode(line.removesuffix("\n")).decode("utf-8") for line in fp.readlines())
 
 
 def _store_credentials(filename: str, *credentials: str) -> None:
-    platformdir_info.user_config_path.mkdir(parents=True, exist_ok=True)
     secret_file_path = platformdir_info.user_config_path / filename
+    secret_file_path = resolve_path_with_links(secret_file_path)
     with secret_file_path.open("w", encoding="utf-8") as fp:
-        for arg in credentials:
-            fp.write(base2048.encode(arg.encode()))
+        for cred in credentials:
+            fp.write(base2048.encode(cred.encode()))
             fp.write("\n")
 
 
@@ -879,4 +938,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    os.umask(0o077)
     raise SystemExit(main())
