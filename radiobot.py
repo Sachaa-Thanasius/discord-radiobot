@@ -322,7 +322,8 @@ async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "r
                 embed = await format_track_embed(discord.Embed(color=0x0389DA, title="Currently Playing"), vc.current)
                 if original := vc.current_original:
                     spotify_url = SPOTIFY_URL.format(original.uri.rpartition(":")[2])
-                    embed.add_field(name="Spotify Source", value=f"[Link]({spotify_url})")
+                    spotify_emoji = MUSIC_EMOJIS[spotify.SpotifyTrack]
+                    embed.add_field(name=f"{spotify_emoji} Spotify Source", value=f"[Link]({spotify_url})")
             else:
                 embed = discord.Embed(description="Nothing is currently playing.")
         else:
@@ -827,7 +828,7 @@ def _input_spotify_creds() -> None:
     )
     creds: list[str] = [secret for prompt in prompts if (secret := getpass.getpass(prompt))]
     if not creds:
-        print("No Spotify credentials passed in. Continuing...")  # noqa: T201
+        log.info("No Spotify credentials passed in. Continuing...")
         return
     if len(creds) == 1:
         msg = "If you add Spotify credentials, you must add the client ID AND the client secret, not just one."
