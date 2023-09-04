@@ -141,7 +141,7 @@ def _add_radio(
     with conn:
         cursor = conn.cursor()
         cursor.execute(UPSERT_GUILD_RADIO_STATEMENT, (guild_id, channel_id, station_link, always_shuffle))
-        # Throws an BusyError if not done in a similar way.
+        # Throws an BusyError if not done like this.
         rows = list(cursor)
         return GuildRadioInfo.from_row(rows[0]) if rows[0] else None
 
@@ -181,6 +181,7 @@ async def format_track_embed(embed: discord.Embed, track: AnyTrack) -> discord.E
         uri = track.uri or ""
         author = escape_markdown(track.author) if track.author else ""
     else:
+        assert track.uri  # Not sure why this is necessary, but pyright complains otherwise.
         uri = SPOTIFY_URL.format(track.uri.rpartition(":")[2])
         author = escape_markdown(", ".join(track.artists))
 
