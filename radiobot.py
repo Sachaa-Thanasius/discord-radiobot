@@ -99,7 +99,6 @@ class GuildRadioInfo:
         guild_id, channel_id, station_link, always_shuffle = row
         return cls(guild_id, channel_id, station_link, bool(always_shuffle))
 
-    @functools.cached_property
     def display_embed(self: Self) -> discord.Embed:
         """Format the radio's information into a Discord embed."""
 
@@ -245,7 +244,7 @@ async def radio_get(itx: discord.Interaction[RadioBot]) -> None:
     local_radio_results = await asyncio.to_thread(_query, itx.client.db_connection, [(itx.guild_id,)])
 
     if local_radio_results and (local_radio := local_radio_results[0]):
-        await itx.response.send_message(embed=local_radio.display_embed)
+        await itx.response.send_message(embed=local_radio.display_embed())
     else:
         await itx.response.send_message("No radio found for this guild.")
 
@@ -328,7 +327,7 @@ async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "r
             else:
                 embed = discord.Embed(description="Nothing is currently playing.")
         else:
-            embed = vc.radio_info.display_embed
+            embed = vc.radio_info.display_embed()
         await itx.response.send_message(embed=embed, ephemeral=True)
     else:
         await itx.response.send_message("No radio currently active in this server.")
