@@ -165,11 +165,11 @@ def resolve_path_with_links(path: Path, folder: bool = False) -> Path:
         return path.resolve(strict=True)
 
 
-async def format_track_embed(embed: discord.Embed, track: AnyTrack) -> discord.Embed:
+async def format_track_embed(title: str, track: AnyTrack) -> discord.Embed:
     """Modify an embed to show information about a Wavelink track."""
 
     icon = MUSIC_EMOJIS.get(type(track), "\N{MUSICAL NOTE}")
-    embed.title = f"{icon} {(embed.title or '')}"
+    title = f"{icon} {title}"
     description_template = "[{0}]({1})\n{2}\n`[0:00-{3}]`"
 
     try:
@@ -181,12 +181,13 @@ async def format_track_embed(embed: discord.Embed, track: AnyTrack) -> discord.E
         uri = track.uri or ""
         author = escape_markdown(track.author) if track.author else ""
     else:
-        assert track.uri  # Not sure why this is necessary, but pyright complains otherwise.
         uri = SPOTIFY_URL.format(track.uri.rpartition(":")[2])
         author = escape_markdown(", ".join(track.artists))
 
-    title = escape_markdown(track.title)
-    embed.description = description_template.format(title, uri, author, end_time)
+    track_title = escape_markdown(track.title)
+    description = description_template.format(track_title, uri, author, end_time)
+
+    embed = discord.Embed(color=0x0389DA, title=title, description=description)
 
     if isinstance(track, wavelink.YouTubeTrack):
         thumbnail = await track.fetch_thumbnail()
@@ -218,7 +219,7 @@ async def radio_set(
         Whether the station should shuffle its internal playlist whenever it loops. By default True.
     """
 
-    assert itx.guild  # Known quantity in guild-only command.
+    assert itx.guild  # Known at runtime.
 
     record = await itx.client.save_radio(
         guild_id=itx.guild.id,
@@ -239,7 +240,7 @@ async def radio_set(
 async def radio_get(itx: discord.Interaction[RadioBot]) -> None:
     """Get information about your server's current radio setup. May need /restart to be up to date."""
 
-    assert itx.guild_id  # Known quantity in guild-only command.
+    assert itx.guild_id  # Known at runtime.
 
     local_radio_results = await asyncio.to_thread(_query, itx.client.db_connection, [(itx.guild_id,)])
 
@@ -255,7 +256,7 @@ async def radio_get(itx: discord.Interaction[RadioBot]) -> None:
 async def radio_delete(itx: discord.Interaction[RadioBot]) -> None:
     """Delete the radio for the current guild. May need /restart to be up to date."""
 
-    assert itx.guild_id  # Known quantity in guild-only command.
+    assert itx.guild_id  # Known at runtime.
 
     await itx.client.delete_radio(itx.guild_id)
     await itx.response.send_message("If this guild had a radio, it has now been deleted.")
@@ -267,7 +268,7 @@ async def radio_delete(itx: discord.Interaction[RadioBot]) -> None:
 async def radio_restart(itx: discord.Interaction[RadioBot]) -> None:
     """Restart your server's radio. Acts as a reset in case you change something."""
 
-    assert itx.guild  # Known quantity in guild-only command.
+    assert itx.guild  # Known at runtime.
 
     if vc := itx.guild.voice_client:
         await vc.disconnect(force=True)
@@ -286,10 +287,10 @@ async def radio_restart(itx: discord.Interaction[RadioBot]) -> None:
 async def radio_next(itx: discord.Interaction[RadioBot]) -> None:
     """Skip to the next track. If managing roles are set, only members with those can use this command."""
 
-    assert itx.guild  # Known quantity in guild-only command.
-
+    # Known at runtime.
+    assert itx.guild
     vc = itx.guild.voice_client
-    assert isinstance(vc, RadioPlayer | None)  # Known at runtime.
+    assert isinstance(vc, RadioPlayer | None)
 
     if vc:
         await vc.stop()
@@ -311,15 +312,15 @@ async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "r
         What to get information about: the currently playing track, station, or radio. By default, "track".
     """
 
-    assert itx.guild  # Known quantity in guild-only command.
-
+    # Known at runtime.
+    assert itx.guild
     vc = itx.guild.voice_client
-    assert isinstance(vc, RadioPlayer | None)  # Known at runtime.
+    assert isinstance(vc, RadioPlayer | None)
 
     if vc:
         if level == "track":
             if vc.current:
-                embed = await format_track_embed(discord.Embed(color=0x0389DA, title="Currently Playing"), vc.current)
+                embed = await format_track_embed("Currently Playing", vc.current)
                 if original := vc.current_original:
                     spotify_url = SPOTIFY_URL.format(original.uri.rpartition(":")[2])
                     spotify_emoji = MUSIC_EMOJIS[spotify.SpotifyTrack]
@@ -346,12 +347,10 @@ async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) 
         What to change the volume to, between 1 and 1000. Locked to managing roles if those are set. By default, None.
     """
 
-    # Known quantities in guild-only command.
+    # Known at runtime.
     assert itx.guild
-    assert isinstance(itx.user, discord.Member)
-
     vc = itx.guild.voice_client
-    assert isinstance(vc, RadioPlayer | None)  # Known at runtime.
+    assert isinstance(vc, RadioPlayer | None)
 
     if vc:
         if volume is None:
@@ -568,7 +567,7 @@ class VersionableTree(discord.app_commands.CommandTree):
         """
 
         tree_hash = await self.get_hash()
-        tree_hash_path = platformdir_info.user_cache_path / "tree.hash"
+        tree_hash_path = platformdir_info.user_cache_path / "radiobot_tree.hash"
         tree_hash_path = resolve_path_with_links(tree_hash_path)
         with tree_hash_path.open("r+b") as fp:
             data = fp.read()
@@ -816,7 +815,7 @@ def _input_lavalink_creds() -> None:
             msg = "Not storing empty lavalink cred."
             raise RuntimeError(msg)
         creds.append(secret)
-    _store_credentials("lavalink.secrets", *creds)
+    _store_credentials("radiobot_lavalink.secrets", *creds)
 
 
 def _input_spotify_creds() -> None:
@@ -833,7 +832,7 @@ def _input_spotify_creds() -> None:
     if len(creds) == 1:
         msg = "If you add Spotify credentials, you must add the client ID AND the client secret, not just one."
         raise RuntimeError(msg)
-    _store_credentials("spotify.secrets", *creds)
+    _store_credentials("radiobot_spotify.secrets", *creds)
 
 
 def _get_token() -> str:
@@ -850,7 +849,7 @@ def _get_token() -> str:
 def _get_lavalink_creds() -> dict[str, str]:
     if (ll_uri := os.getenv("LAVALINK_URI")) and (ll_pwd := os.getenv("LAVALINK_PASSWORD")):
         lavalink_creds = {"uri": ll_uri, "password": ll_pwd}
-    elif ll_creds := _get_stored_credentials("lavalink.secrets"):
+    elif ll_creds := _get_stored_credentials("radiobot_lavalink.secrets"):
         lavalink_creds = {"uri": ll_creds[0], "password": ll_creds[1]}
     else:
         msg = (
@@ -864,7 +863,7 @@ def _get_lavalink_creds() -> dict[str, str]:
 def _get_spotify_creds() -> dict[str, str] | None:
     if (sp_client_id := os.getenv("SPOTIFY_CLIENT_ID")) and (sp_client_secret := os.getenv("SPOTIFY_CLIENT_SECRET")):
         spotify_creds = {"client_id": sp_client_id, "client_secret": sp_client_secret}
-    elif sp_creds := _get_stored_credentials("spotify.secrets"):
+    elif sp_creds := _get_stored_credentials("radiobot_spotify.secrets"):
         spotify_creds = {"client_id": sp_creds[0], "client_secret": sp_creds[1]}
     else:
         log.warning(
@@ -899,7 +898,7 @@ def run_client() -> None:
 
 def main() -> None:
     token_req = bool(_get_stored_credentials("radiobot.token"))
-    lavalink_req = bool(_get_stored_credentials("lavalink.secrets"))
+    lavalink_req = bool(_get_stored_credentials("radiobot_lavalink.secrets"))
 
     parser = argparse.ArgumentParser(description="A minimal configuration discord bot for server radios.")
     setup_group = parser.add_argument_group(
