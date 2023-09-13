@@ -896,8 +896,8 @@ def run_client() -> None:
 
 
 def main() -> None:
-    token_req = bool(_get_stored_credentials("radiobot.token"))
-    lavalink_req = bool(_get_stored_credentials("radiobot_lavalink.secrets"))
+    token_req = bool(_get_token())
+    lavalink_req = bool(_get_lavalink_creds())
 
     parser = argparse.ArgumentParser(description="A minimal configuration discord bot for server radios.")
     setup_group = parser.add_argument_group(
