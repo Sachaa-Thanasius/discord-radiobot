@@ -632,10 +632,9 @@ class RadioBot(discord.AutoShardedClient):
     def __init__(self: Self, config: dict[str, Any]) -> None:
         self.config = config
         super().__init__(
-            intents=discord.Intents.default(),  # Can be reduced later.
+            intents=discord.Intents(guilds=True, voice_states=True, typing=True),
             activity=discord.Game(name="https://github.com/Sachaa-Thanasius/discord-radiobot"),
         )
-
         self.tree = VersionableTree(self)
 
         # Connect to the database that will store the radio information.
