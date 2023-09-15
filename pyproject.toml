@@ -49,7 +49,6 @@ ignore = [
     "SIM105",  # Suppressable exception. I'm not paying the overhead of contextlib.supress for stylistic choices.
     "C90",     # McCabe complexity memes.
     "PLR0913", # More than 5 arguments isn't a problem here.
-    "ANN401",  # Need to type-hint *args and **kwargs with Any.
 ]
 unfixable = [
     "ERA", # Don't want erroneous deletion of comments.
