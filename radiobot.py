@@ -145,6 +145,17 @@ def _add_radio(
         return GuildRadioInfo.from_row(rows[0]) if rows[0] else None
 
 
+class WavelinkSearchError(Exception):
+    """Exception raised when a wavelink search fails to find any tracks.
+
+    This inherits from :exc:`Exception`.
+    """
+
+    def __init__(self: Self, *args: object) -> None:
+        self.message = "Failed to not find any songs matching that query."
+        super().__init__(*args)
+
+
 def resolve_path_with_links(path: Path, folder: bool = False) -> Path:
     """Resolve a path strictly with more secure default permissions, creating the path if necessary.
 
@@ -433,15 +444,17 @@ class WavelinkTrackConverter:
     @classmethod
     async def convert(cls: type[Self], argument: str) -> AnyTrack | AnyTrackIterable:
         """Attempt to convert a string into a Wavelink track or list of tracks."""
-
-        search_type = cls._get_search_type(argument)
-        if issubclass(search_type, spotify.SpotifyTrack):
-            try:
-                tracks = search_type.iterator(query=argument)
-            except TypeError:
+        try:
+            search_type = cls._get_search_type(argument)
+            if issubclass(search_type, spotify.SpotifyTrack):
+                try:
+                    tracks = search_type.iterator(query=argument)
+                except TypeError:
+                    tracks = await search_type.search(argument)
+            else:
                 tracks = await search_type.search(argument)
-        else:
-            tracks = await search_type.search(argument)
+        except (ValueError, IndexError, wavelink.WavelinkException) as err:
+            raise WavelinkSearchError from err
 
         if not tracks:
             msg = f"Your search query `{argument}` returned no tracks."
@@ -455,8 +468,16 @@ class WavelinkTrackConverter:
 
 
 class RadioQueue(wavelink.Queue):
-    async def put_iterable_wait(self: Self, tracks: AnyTrack | AnyTrackIterable) -> None:
-        """Put items from an iterable into the queue asynchronously using await."""
+    async def put_all_wait(self: Self, tracks: AnyTrack | AnyTrackIterable) -> None:
+        """Put items individually or from an iterable into the queue asynchronously using await.
+
+        This can include some playlist subclasses.
+
+        Parameters
+        ----------
+        item : :class:`AnyPlayable` | :class:`AnyTrackIterable`
+            The track or collection of tracks to add to the queue.
+        """
 
         if isinstance(tracks, Iterable):
             for sub_item in tracks:
@@ -520,14 +541,29 @@ class RadioPlayer(wavelink.Player):
         return await super().play(track, replace, start, end, volume, populate=populate)
 
     async def regenerate_radio_queue(self: Self) -> None:
-        """Recreate the queue based on the track link in the player's radio info."""
+        """Recreate the queue based on the track link in the player's radio info.
 
-        self.queue.clear()
-        converted = await WavelinkTrackConverter.convert(self.radio_info.station_link)
-        await self.queue.put_iterable_wait(converted)
-        self.queue.loop_all = True
-        if self.radio_info.always_shuffle:
-            self.queue.shuffle()
+        Raises
+        ------
+        WavelinkSearchError
+            Failed to regenerate the queue.
+        """
+
+        try:
+            converted = await WavelinkTrackConverter.convert(self.radio_info.station_link)
+        except WavelinkSearchError:
+            if self.channel:
+                embed = discord.Embed(description="Failed to regenerate the queue").add_field(
+                    name="Radio link",
+                    value=self.radio_info.station_link,
+                )
+                await self.channel.send(embed=embed)
+        else:
+            self.queue.clear()
+            await self.queue.put_all_wait(converted)
+            self.queue.loop_all = True
+            if self.radio_info.always_shuffle:
+                self.queue.shuffle()
 
 
 class VersionableTree(discord.app_commands.CommandTree):
@@ -650,16 +686,23 @@ class RadioBot(discord.AutoShardedClient):
 
         if player.is_connected():
             queue_length_before = len(player.queue)
-            try:
-                next_track = player.queue.get()
-            except wavelink.QueueEmpty:
-                assert player.channel  # Known at runtime.
-                await player.channel.send("Something went wrong with the current station. Stopping now.")
-                await player.stop()
-            else:
-                await player.play(next_track)
-                if queue_length_before == 1 and player.radio_info.always_shuffle:
-                    player.queue.shuffle()
+            while True:
+                try:
+                    next_track = player.queue.get()
+                except wavelink.QueueEmpty:
+                    assert player.channel  # Known at runtime.
+                    await player.channel.send("Something went wrong with the current station. Stopping now.")
+                    await player.stop()
+                else:
+                    try:
+                        await player.play(next_track)
+                    except IndexError:
+                        # Spotify track couldn't found on YouTube. Not much to do besides try the next track.
+                        pass
+                    else:
+                        if queue_length_before == 1 and player.radio_info.always_shuffle:
+                            player.queue.shuffle()
+                        break
         else:
             await player.stop()
 
