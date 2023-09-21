@@ -685,23 +685,21 @@ class RadioBot(discord.AutoShardedClient):
 
         if player.is_connected():
             queue_length_before = len(player.queue)
-            while True:
+            try:
+                next_track = player.queue.get()
+            except wavelink.QueueEmpty:
+                assert player.channel  # Known at runtime.
+                await player.channel.send("Something went wrong with the current station. Stopping now.")
+                await player.stop()
+            else:
                 try:
-                    next_track = player.queue.get()
-                except wavelink.QueueEmpty:
-                    assert player.channel  # Known at runtime.
-                    await player.channel.send("Something went wrong with the current station. Stopping now.")
+                    await player.play(next_track)
+                except IndexError:
+                    # Spotify track couldn't found on YouTube. Not much to do besides try the next track.
                     await player.stop()
                 else:
-                    try:
-                        await player.play(next_track)
-                    except IndexError:
-                        # Spotify track couldn't found on YouTube. Not much to do besides try the next track.
-                        pass
-                    else:
-                        if queue_length_before == 1 and player.radio_info.always_shuffle:
-                            player.queue.shuffle()
-                        break
+                    if queue_length_before == 1 and player.radio_info.always_shuffle:
+                        player.queue.shuffle()
         else:
             await player.stop()
 
