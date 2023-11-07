@@ -9,11 +9,11 @@ import getpass
 import json
 import logging
 import os
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterable, Iterable
 from datetime import timedelta
 from itertools import chain
 from pathlib import Path
-from typing import Any, Literal, Self, TypeAlias, cast
+from typing import Any, Literal, Self, TypeAlias
 
 import apsw
 import apsw.bestpractice
@@ -25,7 +25,7 @@ import wavelink
 import xxhash
 import yarl
 from discord.ext import tasks
-from wavelink.ext import spotify
+from wavelink.ext import spotify  # type: ignore # Pyright doesn't understand the namespace package.
 
 
 try:
@@ -482,9 +482,8 @@ class RadioQueue(wavelink.Queue):
         if isinstance(tracks, Iterable):
             for sub_item in tracks:
                 await self.put_wait(sub_item)
-        elif isinstance(tracks, spotify.SpotifyAsyncIterator):
-            # Awkward casting to satisfy pyright since wavelink isn't fully typed.
-            async for sub_item in cast(AsyncIterator[spotify.SpotifyTrack], tracks):
+        elif isinstance(tracks, AsyncIterable):
+            async for sub_item in tracks:
                 await self.put_wait(sub_item)
         else:
             await self.put_wait(tracks)
@@ -507,7 +506,7 @@ class RadioPlayer(wavelink.Player):
         swap_node_on_disconnect: bool = True,
     ) -> None:
         super().__init__(client, channel, nodes=nodes, swap_node_on_disconnect=swap_node_on_disconnect)
-        self.queue: RadioQueue = RadioQueue()
+        self.queue: RadioQueue = RadioQueue()  # type: ignore [reportIncompatibleVariableOverride]
         self._current_original: spotify.SpotifyTrack | None = None
 
     @property

@@ -1,3 +1,16 @@
+[project]
+name = "discord-radiobot"
+version = "0.0.1"
+description = "A relatively minimal configuration Discord bot for setting up radios."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Sachaa-Thanasius", email = "111999343+Sachaa-Thanasius@users.noreply.github.com" }]
+
+[project.urls]
+Homepage = "https://github.com/Sachaa-Thanasius/discord-radiobot"
+"Bug Tracker" = "https://github.com/Sachaa-Thanasius/discord-radiobot/issues"
+
 [tool.black]
 line-length = 120
 target-version = ["py311"]
@@ -60,6 +73,7 @@ combine-as-imports = true
 
 [tool.pyright]
 include = ["radiobot.py"]
-reportMissingTypeStubs = "none" # Necessary for Wavelink
-typeCheckingMode = "strict"
 pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportPropertyTypeMismatch = "warning"
+reportUnnecessaryTypeIgnoreComment = "warning"
