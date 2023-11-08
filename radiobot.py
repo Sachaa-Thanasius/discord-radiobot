@@ -19,7 +19,7 @@ import apsw.bestpractice
 import base2048
 import discord
 import platformdirs
-import wavelink
+import wavelink  # type: ignore [reportMissingStubs]
 import xxhash
 from discord.ext import tasks
 
