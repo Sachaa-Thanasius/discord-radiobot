@@ -12,11 +12,10 @@ import os
 from datetime import timedelta
 from itertools import chain
 from pathlib import Path
-from typing import Literal, Self, TypeAlias
+from typing import Literal, NamedTuple, Self, TypeAlias
 
 import apsw
 import apsw.bestpractice
-import attrs
 import base2048
 import discord
 import platformdirs
@@ -79,15 +78,14 @@ DELETE_RADIO_BY_GUILD_STATEMENT = """
 DELETE FROM guild_radios WHERE guild_id = ?;
 """
 
+
 # TODO: Consider using vanilla NamedTuples.
-@attrs.define
-class LavalinkCreds:
+class LavalinkCreds(NamedTuple):
     uri: str
     password: str
 
 
-@attrs.frozen
-class GuildRadioInfo:
+class GuildRadioInfo(NamedTuple):
     guild_id: int
     channel_id: int
     station_link: str
