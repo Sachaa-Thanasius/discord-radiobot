@@ -12,7 +12,7 @@ import os
 from datetime import timedelta
 from itertools import chain
 from pathlib import Path
-from typing import Any, Literal, Self, TypeAlias
+from typing import Literal, Self, TypeAlias
 
 import apsw
 import apsw.bestpractice
@@ -47,8 +47,6 @@ MUSIC_EMOJIS: dict[str, str] = {
     "spotify": "<:spotify:1108458132826501140>",
 }
 
-SPOTIFY_URL = "https://open.spotify.com/track/{}"
-
 INITIALIZATION_STATEMENTS = """
 CREATE TABLE IF NOT EXISTS guild_radios (
     guild_id        INTEGER         NOT NULL        PRIMARY KEY,
@@ -80,6 +78,12 @@ RETURNING *;
 DELETE_RADIO_BY_GUILD_STATEMENT = """
 DELETE FROM guild_radios WHERE guild_id = ?;
 """
+
+# TODO: Consider using vanilla NamedTuples.
+@attrs.define
+class LavalinkCreds:
+    uri: str
+    password: str
 
 
 @attrs.frozen
@@ -431,6 +435,9 @@ class RadioPlayer(wavelink.Player):
             track: wavelink.Playable = tracks[0]
             await self.queue.put_wait(track)
 
+        self.autoplay = wavelink.AutoPlayMode.partial
+        self.queue.mode = wavelink.QueueMode.loop_all
+
         if self.radio_info.always_shuffle:
             self.queue.shuffle()
 
@@ -487,18 +494,16 @@ class RadioBot(discord.AutoShardedClient):
 
     Parameters
     ----------
-    config : dict[str, Any]
-        The configuration data for the radios, including Lavalink node credentials and potentially Spotify
-        application credentials to allow Spotify links to work for stations.
+    config : :class:`LavalinkCreds`
+        The configuration data for the radios, including Lavalink node credentials.
 
     Attributes
     ----------
-    config : dict[str, Any]
-        The configuration data for the radios, including Lavalink node credentials and potentially Spotify
-        application credentials to allow Spotify links to work for stations.
+    config : :class:`LavalinkCreds`
+        The configuration data for the radios, including Lavalink node credentials.
     """
 
-    def __init__(self: Self, config: dict[str, Any]) -> None:
+    def __init__(self: Self, config: LavalinkCreds) -> None:
         self.config = config
         super().__init__(
             intents=discord.Intents(guilds=True, voice_states=True, typing=True),
@@ -524,7 +529,7 @@ class RadioBot(discord.AutoShardedClient):
         """Perform a few operations before the bot connects to the Discord Gateway."""
 
         # Connect to the Lavalink node that will provide the music.
-        node = wavelink.Node(**self.config["LAVALINK"])
+        node = wavelink.Node(uri=self.config.uri, password=self.config.password)
         await wavelink.Pool.connect(nodes=[node], client=self)
 
         # Initialize the database and start the loop.
@@ -557,12 +562,10 @@ class RadioBot(discord.AutoShardedClient):
             return
 
         voice_channel = guild.get_channel(radio_info.channel_id)
-        assert isinstance(voice_channel, discord.abc.Connectable)
+        assert isinstance(voice_channel, discord.VoiceChannel | discord.StageChannel)
 
         vc = await voice_channel.connect(cls=RadioPlayer)
         vc.radio_info = radio_info
-        vc.autoplay = wavelink.AutoPlayMode.partial
-        vc.queue.mode = wavelink.QueueMode.loop_all
 
         # Get the playlist of the guild's registered radio station and play it on loop.
         await vc.regenerate_radio_queue()
@@ -697,23 +700,6 @@ def _input_lavalink_creds() -> None:
     _store_credentials("radiobot_lavalink.secrets", *creds)
 
 
-def _input_spotify_creds() -> None:
-    prompts = (
-        "If you want the radio to process Spotify links, paste your Spotify app client id (won't be visible), then "
-        "press enter. It will be stored for later use. Otherwise, just press enter to continue.",
-        "If you previously entered a Spotify app client id, paste your corresponding app client secret, then press "
-        "enter. It will be stored for later use. Otherwise, just press enter to continue.",
-    )
-    creds: list[str] = [secret for prompt in prompts if (secret := getpass.getpass(prompt))]
-    if not creds:
-        log.info("No Spotify credentials passed in. Continuing...")
-        return
-    if len(creds) == 1:
-        msg = "If you add Spotify credentials, you must add the client ID AND the client secret, not just one."
-        raise RuntimeError(msg)
-    _store_credentials("radiobot_spotify.secrets", *creds)
-
-
 def _get_token() -> str:
     token = os.getenv("DISCORD_TOKEN") or _get_stored_credentials("radiobot.token")
     if token is None:
@@ -725,11 +711,11 @@ def _get_token() -> str:
     return token[0] if isinstance(token, tuple) else token
 
 
-def _get_lavalink_creds() -> dict[str, str]:
+def _get_lavalink_creds() -> LavalinkCreds:
     if (ll_uri := os.getenv("LAVALINK_URI")) and (ll_pwd := os.getenv("LAVALINK_PASSWORD")):
-        lavalink_creds = {"uri": ll_uri, "password": ll_pwd}
+        lavalink_creds = LavalinkCreds(ll_uri, ll_pwd)
     elif ll_creds := _get_stored_credentials("radiobot_lavalink.secrets"):
-        lavalink_creds = {"uri": ll_creds[0], "password": ll_creds[1]}
+        lavalink_creds = LavalinkCreds(ll_creds[0], ll_creds[1])
     else:
         msg = (
             "You're missing Lavalink node credentials. Use '--lavalink' in the CLI to trigger setup for it, or provide "
@@ -737,20 +723,6 @@ def _get_lavalink_creds() -> dict[str, str]:
         )
         raise RuntimeError(msg)
     return lavalink_creds
-
-
-def _get_spotify_creds() -> dict[str, str] | None:
-    if (sp_client_id := os.getenv("SPOTIFY_CLIENT_ID")) and (sp_client_secret := os.getenv("SPOTIFY_CLIENT_SECRET")):
-        spotify_creds = {"client_id": sp_client_id, "client_secret": sp_client_secret}
-    elif sp_creds := _get_stored_credentials("radiobot_spotify.secrets"):
-        spotify_creds = {"client_id": sp_creds[0], "client_secret": sp_creds[1]}
-    else:
-        log.warning(
-            "(Optional) You're missing Spotify node credentials. Use '--spotify' in the CLI to trigger setup for it, "
-            "or provide environmental variables labelled 'SPOTIFY_CLIENT_ID' and 'SPOTIFY_CLIENT_SECRET'.",
-        )
-        spotify_creds = None
-    return spotify_creds
 
 
 def run_client() -> None:
@@ -762,13 +734,8 @@ def run_client() -> None:
 
     token = _get_token()
     lavalink_creds = _get_lavalink_creds()
-    spotify_creds = _get_spotify_creds()
 
-    config: dict[str, Any] = {"LAVALINK": lavalink_creds}
-    if spotify_creds:
-        config["SPOTIFY"] = spotify_creds
-
-    client = RadioBot(config)
+    client = RadioBot(lavalink_creds)
 
     loop = uvloop.new_event_loop if (uvloop is not None) else None  # type: ignore
     with asyncio.Runner(loop_factory=loop) as runner:  # type: ignore
@@ -794,20 +761,12 @@ def main() -> None:
         dest="specify_lavalink",
     )
 
-    spotify_help = (
-        "Whether to specify your Spotify app's credentials (required to use Spotify links in stations). "
-        "Initiates interactive setup."
-    )
-    setup_group.add_argument("--spotify", action="store_true", help=spotify_help, dest="specify_spotify")
-
     args = parser.parse_args()
 
     if args.specify_token:
         _input_token()
     if args.specify_lavalink:
         _input_lavalink_creds()
-    if args.specify_spotify:
-        _input_spotify_creds()
 
     run_client()
 
