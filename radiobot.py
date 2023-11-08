@@ -9,23 +9,19 @@ import getpass
 import json
 import logging
 import os
-from collections.abc import AsyncIterable, Iterable
 from datetime import timedelta
 from itertools import chain
 from pathlib import Path
-from typing import Any, Literal, Self, TypeAlias
+from typing import Literal, NamedTuple, Self, TypeAlias
 
 import apsw
 import apsw.bestpractice
-import attrs
 import base2048
 import discord
 import platformdirs
-import wavelink
+import wavelink  # type: ignore [reportMissingStubs]
 import xxhash
-import yarl
 from discord.ext import tasks
-from wavelink.ext import spotify  # type: ignore # Pyright doesn't understand the namespace package.
 
 
 try:
@@ -34,8 +30,6 @@ except ModuleNotFoundError:
     uvloop = None
 
 RadioInfoTuple: TypeAlias = tuple[int, int, str, int]
-AnyTrack: TypeAlias = wavelink.Playable | spotify.SpotifyTrack
-AnyTrackIterable: TypeAlias = list[wavelink.Playable] | list[spotify.SpotifyTrack] | spotify.SpotifyAsyncIterator
 
 # Set up logging.
 apsw.bestpractice.apply(apsw.bestpractice.recommended)  # type: ignore # SQLite WAL mode, logging, and other things.
@@ -45,14 +39,12 @@ log = logging.getLogger(__name__)
 platformdir_info = platformdirs.PlatformDirs("discord-radiobot", "Sachaa-Thanasius", roaming=False)
 escape_markdown = functools.partial(discord.utils.escape_markdown, as_needed=True)
 
-MUSIC_EMOJIS: dict[type[AnyTrack], str] = {
-    wavelink.YouTubeTrack: "<:youtube:1108460195270631537>",
-    wavelink.YouTubeMusicTrack: "<:youtubemusic:954046930713985074>",
-    wavelink.SoundCloudTrack: "<:soundcloud:1147265178505846804>",
-    spotify.SpotifyTrack: "<:spotify:1108458132826501140>",
+MUSIC_EMOJIS: dict[str, str] = {
+    "youtube": "<:youtube:1108460195270631537>",
+    "youtubemusic": "<:youtubemusic:954046930713985074>",
+    "soundcloud": "<:soundcloud:1147265178505846804>",
+    "spotify": "<:spotify:1108458132826501140>",
 }
-
-SPOTIFY_URL = "https://open.spotify.com/track/{}"
 
 INITIALIZATION_STATEMENTS = """
 CREATE TABLE IF NOT EXISTS guild_radios (
@@ -87,8 +79,13 @@ DELETE FROM guild_radios WHERE guild_id = ?;
 """
 
 
-@attrs.frozen
-class GuildRadioInfo:
+# TODO: Consider using vanilla NamedTuples.
+class LavalinkCreds(NamedTuple):
+    uri: str
+    password: str
+
+
+class GuildRadioInfo(NamedTuple):
     guild_id: int
     channel_id: int
     station_link: str
@@ -175,33 +172,29 @@ def resolve_path_with_links(path: Path, folder: bool = False) -> Path:
         return path.resolve(strict=True)
 
 
-async def format_track_embed(title: str, track: AnyTrack) -> discord.Embed:
+async def create_track_embed(title: str, track: wavelink.Playable) -> discord.Embed:
     """Modify an embed to show information about a Wavelink track."""
 
-    icon = MUSIC_EMOJIS.get(type(track), "\N{MUSICAL NOTE}")
+    icon = MUSIC_EMOJIS.get(track.source, "\N{MUSICAL NOTE}")
     title = f"{icon} {title}"
-    description_template = "[{0}]({1})\n{2}\n`[0:00-{3}]`"
+    uri = track.uri or ""
+    author = escape_markdown(track.author)
+    track_title = escape_markdown(track.title)
 
     try:
-        end_time = timedelta(seconds=track.duration // 1000)
+        end_time = timedelta(seconds=track.length // 1000)
     except OverflowError:
         end_time = "\N{INFINITY}"
 
-    if isinstance(track, wavelink.Playable):
-        uri = track.uri or ""
-        author = escape_markdown(track.author) if track.author else ""
-    else:
-        uri = SPOTIFY_URL.format(track.uri.rpartition(":")[2])
-        author = escape_markdown(", ".join(track.artists))
-
-    track_title = escape_markdown(track.title)
-    description = description_template.format(track_title, uri, author, end_time)
+    description = f"[{track_title}]({uri})\n{author}\n`[0:00-{end_time}]`"
 
     embed = discord.Embed(color=0x0389DA, title=title, description=description)
 
-    if isinstance(track, wavelink.YouTubeTrack):
-        thumbnail = await track.fetch_thumbnail()
-        embed.set_thumbnail(url=thumbnail)
+    if track.artwork:
+        embed.set_thumbnail(url=track.artwork)
+
+    if track.album.name:
+        embed.add_field(name="Album", value=track.album.name)
 
     return embed
 
@@ -330,11 +323,7 @@ async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "r
     if vc:
         if level == "track":
             if vc.current:
-                embed = await format_track_embed("Currently Playing", vc.current)
-                if original := vc.current_original:
-                    spotify_url = SPOTIFY_URL.format(original.uri.rpartition(":")[2])
-                    spotify_emoji = MUSIC_EMOJIS[spotify.SpotifyTrack]
-                    embed.add_field(name=f"{spotify_emoji} Spotify Source", value=f"[Link]({spotify_url})")
+                embed = await create_track_embed("Currently Playing", vc.current)
             else:
                 embed = discord.Embed(description="Nothing is currently playing.")
         else:
@@ -402,93 +391,6 @@ async def help_(itx: discord.Interaction[RadioBot]) -> None:
 APP_COMMANDS = [radio_set, radio_get, radio_delete, radio_restart, radio_next, current, volume, invite, help_]
 
 
-class WavelinkTrackConverter:
-    """Converts to what Wavelink considers a playable track (:class:`AnyPlayable` or :class:`AnyTrackIterable`).
-
-    The lookup strategy is as follows (in order):
-
-    1. Lookup by :class:`wavelink.YouTubeTrack` if the argument has no url "scheme".
-    2. Lookup by first valid Wavelink track class if the argument matches the search/url format.
-    3. Lookup by assuming argument to be a direct url or local file address.
-    """
-
-    @staticmethod
-    def _get_search_type(argument: str) -> type[AnyTrack]:
-        """Get the searchable wavelink class that matches the argument string closest."""
-
-        check = yarl.URL(argument)
-
-        if (
-            (not check.host and not check.scheme)
-            or (check.host in ("youtube.com", "www.youtube.com", "m.youtube.com") and "v" in check.query)
-            or check.scheme == "ytsearch"
-        ):
-            search_type = wavelink.YouTubeTrack
-        elif (
-            check.host in ("youtube.com", "www.youtube.com", "m.youtube.com") and "list" in check.query
-        ) or check.scheme == "ytpl":
-            search_type = wavelink.YouTubePlaylist
-        elif check.host == "music.youtube.com" or check.scheme == "ytmsearch":
-            search_type = wavelink.YouTubeMusicTrack
-        elif check.host in ("soundcloud.com", "www.soundcloud.com") and "sets" in check.path.split("/"):
-            search_type = wavelink.SoundCloudPlaylist
-        elif check.host in ("soundcloud.com", "www.soundcloud.com") or check.scheme == "scsearch":
-            search_type = wavelink.SoundCloudTrack
-        elif check.host in ("spotify.com", "open.spotify.com"):
-            search_type = spotify.SpotifyTrack
-        else:
-            search_type = wavelink.GenericTrack
-
-        return search_type
-
-    @classmethod
-    async def convert(cls: type[Self], argument: str) -> AnyTrack | AnyTrackIterable:
-        """Attempt to convert a string into a Wavelink track or list of tracks."""
-        try:
-            search_type = cls._get_search_type(argument)
-            if issubclass(search_type, spotify.SpotifyTrack):
-                try:
-                    tracks = search_type.iterator(query=argument)
-                except TypeError:
-                    tracks = await search_type.search(argument)
-            else:
-                tracks = await search_type.search(argument)
-        except (ValueError, IndexError, wavelink.WavelinkException) as err:
-            raise WavelinkSearchError from err
-
-        if not tracks:
-            msg = f"Your search query `{argument}` returned no tracks."
-            raise wavelink.NoTracksError(msg)
-
-        # Still technically possible for tracks to be a Playlist subclass now.
-        if issubclass(search_type, wavelink.Playable) and isinstance(tracks, list):
-            tracks = tracks[0]
-
-        return tracks
-
-
-class RadioQueue(wavelink.Queue):
-    async def put_all_wait(self: Self, tracks: AnyTrack | AnyTrackIterable) -> None:
-        """Put items individually or from an iterable into the queue asynchronously using await.
-
-        This can include some playlist subclasses.
-
-        Parameters
-        ----------
-        item : :class:`AnyPlayable` | :class:`AnyTrackIterable`
-            The track or collection of tracks to add to the queue.
-        """
-
-        if isinstance(tracks, Iterable):
-            for sub_item in tracks:
-                await self.put_wait(sub_item)
-        elif isinstance(tracks, AsyncIterable):
-            async for sub_item in tracks:
-                await self.put_wait(sub_item)
-        else:
-            await self.put_wait(tracks)
-
-
 class RadioPlayer(wavelink.Player):
     """A wavelink player with data about the radio it represents.
 
@@ -496,18 +398,6 @@ class RadioPlayer(wavelink.Player):
     ----------
     radio_info
     """
-
-    def __init__(
-        self: Self,
-        client: discord.Client = discord.utils.MISSING,
-        channel: discord.VoiceChannel | discord.StageChannel = discord.utils.MISSING,
-        *,
-        nodes: list[wavelink.Node] | None = None,
-        swap_node_on_disconnect: bool = True,
-    ) -> None:
-        super().__init__(client, channel, nodes=nodes, swap_node_on_disconnect=swap_node_on_disconnect)
-        self.queue: RadioQueue = RadioQueue()  # type: ignore [reportIncompatibleVariableOverride]
-        self._current_original: spotify.SpotifyTrack | None = None
 
     @property
     def radio_info(self: Self) -> GuildRadioInfo:
@@ -519,26 +409,6 @@ class RadioPlayer(wavelink.Player):
     def radio_info(self: Self, value: GuildRadioInfo) -> None:
         self._radio_info = value
 
-    @property
-    def current_original(self: Self) -> spotify.SpotifyTrack | None:
-        """`spotify.SpotifyTrack | None`: If the current track is from Spotify, this will have the original metadata."""
-
-        return self._current_original
-
-    async def play(
-        self: Self,
-        track: AnyTrack,
-        replace: bool = True,
-        start: int | None = None,
-        end: int | None = None,
-        volume: int | None = None,
-        *,
-        populate: bool = False,
-    ) -> wavelink.Playable:
-        # Only for capturing the original Spotify track.
-        self._current_original = track if isinstance(track, spotify.SpotifyTrack) else None
-        return await super().play(track, replace, start, end, volume, populate=populate)
-
     async def regenerate_radio_queue(self: Self) -> None:
         """Recreate the queue based on the track link in the player's radio info.
 
@@ -548,21 +418,26 @@ class RadioPlayer(wavelink.Player):
             Failed to regenerate the queue.
         """
 
-        try:
-            converted = await WavelinkTrackConverter.convert(self.radio_info.station_link)
-        except WavelinkSearchError:
-            if self.channel:
-                embed = discord.Embed(description="Failed to regenerate the queue").add_field(
-                    name="Radio link",
-                    value=self.radio_info.station_link,
-                )
-                await self.channel.send(embed=embed)
+        self.queue.clear()
+
+        tracks: wavelink.Search = await wavelink.Playable.search(self.radio_info.station_link)
+        if not tracks:
+            embed = discord.Embed(description="Failed to regenerate the queue")
+            embed.add_field(name="Radio link", value=self.radio_info.station_link)
+            await self.channel.send(embed=embed)
+            return
+
+        if isinstance(tracks, wavelink.Playlist):
+            await self.queue.put_wait(tracks)
         else:
-            self.queue.clear()
-            await self.queue.put_all_wait(converted)
-            self.queue.loop_all = True
-            if self.radio_info.always_shuffle:
-                self.queue.shuffle()
+            track: wavelink.Playable = tracks[0]
+            await self.queue.put_wait(track)
+
+        self.autoplay = wavelink.AutoPlayMode.partial
+        self.queue.mode = wavelink.QueueMode.loop_all
+
+        if self.radio_info.always_shuffle:
+            self.queue.shuffle()
 
 
 class VersionableTree(discord.app_commands.CommandTree):
@@ -617,18 +492,16 @@ class RadioBot(discord.AutoShardedClient):
 
     Parameters
     ----------
-    config : dict[str, Any]
-        The configuration data for the radios, including Lavalink node credentials and potentially Spotify
-        application credentials to allow Spotify links to work for stations.
+    config : :class:`LavalinkCreds`
+        The configuration data for the radios, including Lavalink node credentials.
 
     Attributes
     ----------
-    config : dict[str, Any]
-        The configuration data for the radios, including Lavalink node credentials and potentially Spotify
-        application credentials to allow Spotify links to work for stations.
+    config : :class:`LavalinkCreds`
+        The configuration data for the radios, including Lavalink node credentials.
     """
 
-    def __init__(self: Self, config: dict[str, Any]) -> None:
+    def __init__(self: Self, config: LavalinkCreds) -> None:
         self.config = config
         super().__init__(
             intents=discord.Intents(guilds=True, voice_states=True, typing=True),
@@ -654,9 +527,8 @@ class RadioBot(discord.AutoShardedClient):
         """Perform a few operations before the bot connects to the Discord Gateway."""
 
         # Connect to the Lavalink node that will provide the music.
-        node = wavelink.Node(**self.config["LAVALINK"])
-        sc = spotify.SpotifyClient(**self.config["SPOTIFY"]) if ("SPOTIFY" in self.config) else None
-        await wavelink.NodePool.connect(client=self, nodes=[node], spotify=sc)
+        node = wavelink.Node(uri=self.config.uri, password=self.config.password)
+        await wavelink.Pool.connect(nodes=[node], client=self)
 
         # Initialize the database and start the loop.
         self._radio_enabled_guilds: set[int] = await asyncio.to_thread(_setup_db, self.db_connection)
@@ -672,35 +544,6 @@ class RadioBot(discord.AutoShardedClient):
     async def close(self: Self) -> None:
         self.radio_loop.cancel()
         await super().close()
-
-    async def on_wavelink_track_end(self: Self, payload: wavelink.TrackEventPayload) -> None:
-        """Called when the current track has finished playing.
-
-        Plays the next track in the queue so long as the player hasn't disconnected.
-        """
-
-        player = payload.player
-        assert isinstance(player, RadioPlayer)  # Known at runtime.
-
-        if player.is_connected():
-            queue_length_before = len(player.queue)
-            try:
-                next_track = player.queue.get()
-            except wavelink.QueueEmpty:
-                assert player.channel  # Known at runtime.
-                await player.channel.send("Something went wrong with the current station. Stopping now.")
-                await player.stop()
-            else:
-                try:
-                    await player.play(next_track)
-                except IndexError:
-                    # Spotify track couldn't found on YouTube. Not much to do besides try the next track.
-                    await player.stop()
-                else:
-                    if queue_length_before == 1 and player.radio_info.always_shuffle:
-                        player.queue.shuffle()
-        else:
-            await player.stop()
 
     async def start_guild_radio(self: Self, radio_info: GuildRadioInfo) -> None:
         """Create a radio voice client for a guild and start its preset station playlist.
@@ -719,8 +562,7 @@ class RadioBot(discord.AutoShardedClient):
         voice_channel = guild.get_channel(radio_info.channel_id)
         assert isinstance(voice_channel, discord.VoiceChannel | discord.StageChannel)
 
-        # This player should be compatible with discord.py's connect.
-        vc = await voice_channel.connect(cls=RadioPlayer)  # type: ignore
+        vc = await voice_channel.connect(cls=RadioPlayer)
         vc.radio_info = radio_info
 
         # Get the playlist of the guild's registered radio station and play it on loop.
@@ -856,23 +698,6 @@ def _input_lavalink_creds() -> None:
     _store_credentials("radiobot_lavalink.secrets", *creds)
 
 
-def _input_spotify_creds() -> None:
-    prompts = (
-        "If you want the radio to process Spotify links, paste your Spotify app client id (won't be visible), then "
-        "press enter. It will be stored for later use. Otherwise, just press enter to continue.",
-        "If you previously entered a Spotify app client id, paste your corresponding app client secret, then press "
-        "enter. It will be stored for later use. Otherwise, just press enter to continue.",
-    )
-    creds: list[str] = [secret for prompt in prompts if (secret := getpass.getpass(prompt))]
-    if not creds:
-        log.info("No Spotify credentials passed in. Continuing...")
-        return
-    if len(creds) == 1:
-        msg = "If you add Spotify credentials, you must add the client ID AND the client secret, not just one."
-        raise RuntimeError(msg)
-    _store_credentials("radiobot_spotify.secrets", *creds)
-
-
 def _get_token() -> str:
     token = os.getenv("DISCORD_TOKEN") or _get_stored_credentials("radiobot.token")
     if token is None:
@@ -884,11 +709,11 @@ def _get_token() -> str:
     return token[0] if isinstance(token, tuple) else token
 
 
-def _get_lavalink_creds() -> dict[str, str]:
+def _get_lavalink_creds() -> LavalinkCreds:
     if (ll_uri := os.getenv("LAVALINK_URI")) and (ll_pwd := os.getenv("LAVALINK_PASSWORD")):
-        lavalink_creds = {"uri": ll_uri, "password": ll_pwd}
+        lavalink_creds = LavalinkCreds(ll_uri, ll_pwd)
     elif ll_creds := _get_stored_credentials("radiobot_lavalink.secrets"):
-        lavalink_creds = {"uri": ll_creds[0], "password": ll_creds[1]}
+        lavalink_creds = LavalinkCreds(ll_creds[0], ll_creds[1])
     else:
         msg = (
             "You're missing Lavalink node credentials. Use '--lavalink' in the CLI to trigger setup for it, or provide "
@@ -896,20 +721,6 @@ def _get_lavalink_creds() -> dict[str, str]:
         )
         raise RuntimeError(msg)
     return lavalink_creds
-
-
-def _get_spotify_creds() -> dict[str, str] | None:
-    if (sp_client_id := os.getenv("SPOTIFY_CLIENT_ID")) and (sp_client_secret := os.getenv("SPOTIFY_CLIENT_SECRET")):
-        spotify_creds = {"client_id": sp_client_id, "client_secret": sp_client_secret}
-    elif sp_creds := _get_stored_credentials("radiobot_spotify.secrets"):
-        spotify_creds = {"client_id": sp_creds[0], "client_secret": sp_creds[1]}
-    else:
-        log.warning(
-            "(Optional) You're missing Spotify node credentials. Use '--spotify' in the CLI to trigger setup for it, "
-            "or provide environmental variables labelled 'SPOTIFY_CLIENT_ID' and 'SPOTIFY_CLIENT_SECRET'.",
-        )
-        spotify_creds = None
-    return spotify_creds
 
 
 def run_client() -> None:
@@ -921,13 +732,8 @@ def run_client() -> None:
 
     token = _get_token()
     lavalink_creds = _get_lavalink_creds()
-    spotify_creds = _get_spotify_creds()
 
-    config: dict[str, Any] = {"LAVALINK": lavalink_creds}
-    if spotify_creds:
-        config["SPOTIFY"] = spotify_creds
-
-    client = RadioBot(config)
+    client = RadioBot(lavalink_creds)
 
     loop = uvloop.new_event_loop if (uvloop is not None) else None  # type: ignore
     with asyncio.Runner(loop_factory=loop) as runner:  # type: ignore
@@ -953,20 +759,12 @@ def main() -> None:
         dest="specify_lavalink",
     )
 
-    spotify_help = (
-        "Whether to specify your Spotify app's credentials (required to use Spotify links in stations). "
-        "Initiates interactive setup."
-    )
-    setup_group.add_argument("--spotify", action="store_true", help=spotify_help, dest="specify_spotify")
-
     args = parser.parse_args()
 
     if args.specify_token:
         _input_token()
     if args.specify_lavalink:
         _input_lavalink_creds()
-    if args.specify_spotify:
-        _input_spotify_creds()
 
     run_client()
 
