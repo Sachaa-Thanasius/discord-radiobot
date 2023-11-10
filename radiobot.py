@@ -79,7 +79,6 @@ DELETE FROM guild_radios WHERE guild_id = ?;
 """
 
 
-# TODO: Consider using vanilla NamedTuples.
 class LavalinkCreds(NamedTuple):
     uri: str
     password: str
