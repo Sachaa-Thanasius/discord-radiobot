@@ -11,10 +11,6 @@ authors = [{ name = "Sachaa-Thanasius", email = "111999343+Sachaa-Thanasius@user
 Homepage = "https://github.com/Sachaa-Thanasius/discord-radiobot"
 "Bug Tracker" = "https://github.com/Sachaa-Thanasius/discord-radiobot/issues"
 
-[tool.black]
-line-length = 120
-target-version = ["py311"]
-
 [tool.ruff]
 # Credit to @mikeshardmind for most of this setup.
 line-length = 120
@@ -62,6 +58,14 @@ ignore = [
     "SIM105",  # Suppressable exception. I'm not paying the overhead of contextlib.supress for stylistic choices.
     "C90",     # McCabe complexity memes.
     "PLR0913", # More than 5 arguments isn't a problem here.
+    "ANN101",  # Type of self is implied.
+    "PLR",     # Complexity things.
+    # Recommended by ruff when using ruff format.
+    "COM812",
+    "COM819",
+    "E501",
+    "ISC001",
+    "Q003",
 ]
 unfixable = [
     "ERA", # Don't want erroneous deletion of comments.

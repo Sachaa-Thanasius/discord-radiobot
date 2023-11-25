@@ -12,7 +12,7 @@ import os
 from datetime import timedelta
 from itertools import chain
 from pathlib import Path
-from typing import Literal, NamedTuple, Self, TypeAlias
+from typing import Any, Literal, NamedTuple, Self, TypeAlias
 
 import apsw
 import apsw.bestpractice
@@ -21,6 +21,7 @@ import discord
 import platformdirs
 import wavelink
 import xxhash
+from discord import app_commands
 from discord.ext import tasks
 
 
@@ -34,7 +35,7 @@ RadioInfoTuple: TypeAlias = tuple[int, int, str, int]
 # Set up logging.
 apsw.bestpractice.apply(apsw.bestpractice.recommended)  # type: ignore # SQLite WAL mode, logging, and other things.
 discord.utils.setup_logging()
-log = logging.getLogger(__name__)
+_log = logging.getLogger(__name__)
 
 platformdir_info = platformdirs.PlatformDirs("discord-radiobot", "Sachaa-Thanasius", roaming=False)
 escape_markdown = functools.partial(discord.utils.escape_markdown, as_needed=True)
@@ -95,7 +96,7 @@ class GuildRadioInfo(NamedTuple):
         guild_id, channel_id, station_link, always_shuffle = row
         return cls(guild_id, channel_id, station_link, bool(always_shuffle))
 
-    def display_embed(self: Self) -> discord.Embed:
+    def display_embed(self) -> discord.Embed:
         """Format the radio's information into a Discord embed."""
 
         return (
@@ -147,7 +148,7 @@ class WavelinkSearchError(Exception):
     This inherits from :exc:`Exception`.
     """
 
-    def __init__(self: Self, *args: object) -> None:
+    def __init__(self, *args: object) -> None:
         self.message = "Failed to not find any songs matching that query."
         super().__init__(*args)
 
@@ -198,9 +199,9 @@ async def create_track_embed(title: str, track: wavelink.Playable) -> discord.Em
     return embed
 
 
-@discord.app_commands.command()
-@discord.app_commands.guild_only()
-@discord.app_commands.default_permissions(manage_guild=True)
+@app_commands.command()
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
 async def radio_set(
     itx: discord.Interaction[RadioBot],
     channel: discord.VoiceChannel | discord.StageChannel,
@@ -237,8 +238,8 @@ async def radio_set(
     await itx.response.send_message(content)
 
 
-@discord.app_commands.command()
-@discord.app_commands.guild_only()
+@app_commands.command()
+@app_commands.guild_only()
 async def radio_get(itx: discord.Interaction[RadioBot]) -> None:
     """Get information about your server's current radio setup. May need /restart to be up to date."""
 
@@ -252,9 +253,9 @@ async def radio_get(itx: discord.Interaction[RadioBot]) -> None:
         await itx.response.send_message("No radio found for this guild.")
 
 
-@discord.app_commands.command()
-@discord.app_commands.guild_only()
-@discord.app_commands.default_permissions(manage_guild=True)
+@app_commands.command()
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
 async def radio_delete(itx: discord.Interaction[RadioBot]) -> None:
     """Delete the radio for the current guild. May need /restart to be up to date."""
 
@@ -264,9 +265,9 @@ async def radio_delete(itx: discord.Interaction[RadioBot]) -> None:
     await itx.response.send_message("If this guild had a radio, it has now been deleted.")
 
 
-@discord.app_commands.command()
-@discord.app_commands.guild_only()
-@discord.app_commands.default_permissions(manage_guild=True)
+@app_commands.command()
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
 async def radio_restart(itx: discord.Interaction[RadioBot]) -> None:
     """Restart your server's radio. Acts as a reset in case you change something."""
 
@@ -283,9 +284,9 @@ async def radio_restart(itx: discord.Interaction[RadioBot]) -> None:
         await itx.response.send_message("This server's radio does not exist. Not restarting.")
 
 
-@discord.app_commands.command()
-@discord.app_commands.guild_only()
-@discord.app_commands.default_permissions(manage_guild=True)
+@app_commands.command()
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
 async def radio_next(itx: discord.Interaction[RadioBot]) -> None:
     """Skip to the next track. If managing roles are set, only members with those can use this command."""
 
@@ -301,8 +302,8 @@ async def radio_next(itx: discord.Interaction[RadioBot]) -> None:
         await itx.response.send_message("No radio currently active in this server.")
 
 
-@discord.app_commands.command()
-@discord.app_commands.guild_only()
+@app_commands.command()
+@app_commands.guild_only()
 async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "radio"] = "track") -> None:
     """See what's currently playing on the radio.
 
@@ -332,8 +333,8 @@ async def current(itx: discord.Interaction[RadioBot], level: Literal["track", "r
         await itx.response.send_message("No radio currently active in this server.")
 
 
-@discord.app_commands.command()
-@discord.app_commands.guild_only()
+@app_commands.command()
+@app_commands.guild_only()
 async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) -> None:
     """See or change the volume of the radio.
 
@@ -360,8 +361,8 @@ async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) 
         await itx.response.send_message("No radio currently active in this server.")
 
 
-@discord.app_commands.command()
-@discord.app_commands.guild_only()
+@app_commands.command()
+@app_commands.guild_only()
 async def invite(itx: discord.Interaction[RadioBot]) -> None:
     """Get a link to invite this bot to a server."""
 
@@ -370,24 +371,51 @@ async def invite(itx: discord.Interaction[RadioBot]) -> None:
     await itx.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
-@discord.app_commands.command(name="help")
-@discord.app_commands.guild_only()
-async def help_(itx: discord.Interaction[RadioBot]) -> None:
-    """Basic instructions for setting up your radio."""
+@app_commands.command(name="help")
+async def _help(itx: discord.Interaction[RadioBot], ephemeral: bool = True) -> None:
+    """See a brief overview of all the bot's available commands and basic instructions for setting it up.
 
-    description = (
-        "1. Create the radio for your server with `/radio_set`, using an audio streaming–capable URL "  # noqa: RUF001
-        "for the 'station'.\n"
-        " - If you want to edit the radio, use the same command. It will require reentering the channel, though.\n"
-        "2. The bot should join the channel specified and begin playing shortly!\n\n"
-        "`/radio_delete`, `/radio_restart`, and `/radio_next` are restricted by default. To change those usage "
-        "permissions, use your server's Integration settings."
+    Parameters
+    ----------
+    itx : :class:`discord.Interaction`
+        The interaction that triggered this command.
+    ephemeral : :class:`bool`, default=True
+        Whether the output should be visible to only you. Defaults to True.
+    """
+
+    help_embed = discord.Embed(
+        title="Help",
+        description=(
+            "1. Create the radio for your server with `/radio_set`, using an audio streaming–capable URL "  # noqa: RUF001
+            "for the 'station'.\n"
+            " - If you want to edit the radio, use the same command. It will require reentering the channel, though.\n"
+            "2. The bot should join the channel specified and begin playing shortly!\n\n"
+            "`/radio_delete`, `/radio_restart`, and `/radio_next` are restricted by default. To change those usage "
+            "permissions, use your server's Integration settings."
+        ),
     )
-    embed = discord.Embed(description=description)
-    await itx.response.send_message(embed=embed)
+
+    for cmd in itx.client.tree.walk_commands():
+        if isinstance(cmd, app_commands.Command):
+            mention = await itx.client.tree.find_mention_for(cmd)
+            description = cmd.callback.__doc__ or cmd.description
+        else:
+            mention = f"/{cmd.name}"
+            description = cmd.__doc__ or cmd.description
+
+        try:
+            index = description.index("Parameters")
+        except ValueError:
+            pass
+        else:
+            description = description[:index]
+
+        help_embed.add_field(name=mention, value=description, inline=False)
+
+    await itx.response.send_message(embed=help_embed, ephemeral=ephemeral)
 
 
-APP_COMMANDS = [radio_set, radio_get, radio_delete, radio_restart, radio_next, current, volume, invite, help_]
+APP_COMMANDS = [radio_set, radio_get, radio_delete, radio_restart, radio_next, current, volume, _help, invite]
 
 
 class RadioPlayer(wavelink.Player):
@@ -399,16 +427,16 @@ class RadioPlayer(wavelink.Player):
     """
 
     @property
-    def radio_info(self: Self) -> GuildRadioInfo:
+    def radio_info(self) -> GuildRadioInfo:
         """`GuildRadioInfo`: A dataclass instance with information about the radio that this player is representing."""
 
         return self._radio_info
 
     @radio_info.setter
-    def radio_info(self: Self, value: GuildRadioInfo) -> None:
+    def radio_info(self, value: GuildRadioInfo) -> None:
         self._radio_info = value
 
-    async def regenerate_radio_queue(self: Self) -> None:
+    async def regenerate_radio_queue(self) -> None:
         """Recreate the queue based on the track link in the player's radio info.
 
         Raises
@@ -439,20 +467,64 @@ class RadioPlayer(wavelink.Player):
             self.queue.shuffle()
 
 
-class VersionableTree(discord.app_commands.CommandTree):
-    """A command tree with a two new methods:
+class VersionableTree(app_commands.CommandTree):
+    """A custom command tree to handle autosyncing and save command mentions."""
 
-    1. Generate a unique hash to represent all commands currently in the tree.
-    2. Compare hash of the current tree against that of a previous version using the above method.
+    def __init__(self, client: RadioBot, *, fallback_to_global: bool = True) -> None:
+        super().__init__(client, fallback_to_global=fallback_to_global)
+        self.application_commands: dict[int | None, list[app_commands.AppCommand]] = {}
 
-    Credit to @mikeshardmind: Everything in this class is his.
+    async def sync(self, *, guild: discord.abc.Snowflake | None = None) -> list[app_commands.AppCommand]:
+        ret = await super().sync(guild=guild)
+        self.application_commands[guild.id if guild else None] = ret
+        return ret
 
-    Notes
-    -----
-    The main use case is autosyncing using the hash comparison as a condition.
-    """
+    async def fetch_commands(
+        self,
+        *,
+        guild: discord.abc.Snowflake | None = None,
+    ) -> list[app_commands.AppCommand]:
+        ret = await super().fetch_commands(guild=guild)
+        self.application_commands[guild.id if guild else None] = ret
+        return ret
 
-    async def get_hash(self: Self) -> bytes:
+    async def find_mention_for(
+        self,
+        command: app_commands.Command[Any, ..., Any],
+        *,
+        guild: discord.abc.Snowflake | None = None,
+    ) -> str | None:
+        """Retrieves the mention of an AppCommand given a specific Command and optionally, a guild.
+
+        Credit to LeoCx1000: The implemention for storing mentions of tree commands is his.
+        https://gist.github.com/LeoCx1000/021dc52981299b95ea7790416e4f5ca4
+
+        Parameters
+        ----------
+        command: :class:`app_commands.Command`
+            The command which it's mention we will attempt to retrieve.
+        guild: :class:`discord.abc.Snowflake` | None
+            The scope (guild) from which to retrieve the commands from.
+            If None is given or not passed, the global scope will be used.
+        """
+
+        try:
+            found_commands = self.application_commands[guild.id if guild else None]
+        except KeyError:
+            found_commands = await self.fetch_commands(guild=guild)
+
+        root_parent = command.root_parent or command
+        command_found = discord.utils.get(found_commands, name=root_parent.name)
+        if command_found:
+            return f"</{command.qualified_name}:{command_found.id}>"
+        return None
+
+    async def get_hash(self) -> bytes:
+        """Generate a unique hash to represent all commands currently in the tree.
+
+        Credit to @mikeshardmind: The hashing methods in this class are his.
+        """
+
         commands = sorted(self._get_all_commands(guild=None), key=lambda c: c.qualified_name)
 
         translator = self.translator
@@ -463,7 +535,7 @@ class VersionableTree(discord.app_commands.CommandTree):
 
         return xxhash.xxh3_64_digest(json.dumps(payload).encode("utf-8"), seed=1)
 
-    async def sync_if_commands_updated(self: Self) -> None:
+    async def sync_if_commands_updated(self) -> None:
         """Sync the tree globally if its commands are different from the tree's most recent previous version.
 
         Comparison is done with hashes, with the hash being stored in a specific file if unique for later comparison.
@@ -480,7 +552,7 @@ class VersionableTree(discord.app_commands.CommandTree):
         with tree_hash_path.open("r+b") as fp:
             data = fp.read()
             if data != tree_hash:
-                log.info("New version of the command tree. Syncing now.")
+                _log.info("New version of the command tree. Syncing now.")
                 await self.sync()
                 fp.seek(0)
                 fp.write(tree_hash)
@@ -500,7 +572,7 @@ class RadioBot(discord.AutoShardedClient):
         The configuration data for the radios, including Lavalink node credentials.
     """
 
-    def __init__(self: Self, config: LavalinkCreds) -> None:
+    def __init__(self, config: LavalinkCreds) -> None:
         self.config = config
         super().__init__(
             intents=discord.Intents(guilds=True, voice_states=True, typing=True),
@@ -514,7 +586,7 @@ class RadioBot(discord.AutoShardedClient):
         resolved_path_as_str = str(resolve_path_with_links(db_path))
         self.db_connection = apsw.Connection(resolved_path_as_str)
 
-    async def on_connect(self: Self) -> None:
+    async def on_connect(self) -> None:
         """(Re)set the client's general invite link every time it (re)connects to the Discord Gateway."""
 
         await self.wait_until_ready()
@@ -522,7 +594,7 @@ class RadioBot(discord.AutoShardedClient):
         perms = discord.Permissions(274881367040)
         self.invite_link = discord.utils.oauth_url(data.id, permissions=perms)
 
-    async def setup_hook(self: Self) -> None:
+    async def setup_hook(self) -> None:
         """Perform a few operations before the bot connects to the Discord Gateway."""
 
         # Connect to the Lavalink node that will provide the music.
@@ -540,11 +612,11 @@ class RadioBot(discord.AutoShardedClient):
         # Sync the tree if it's different from the previous version, using hashing for comparison.
         await self.tree.sync_if_commands_updated()
 
-    async def close(self: Self) -> None:
+    async def close(self) -> None:
         self.radio_loop.cancel()
         await super().close()
 
-    async def start_guild_radio(self: Self, radio_info: GuildRadioInfo) -> None:
+    async def start_guild_radio(self, radio_info: GuildRadioInfo) -> None:
         """Create a radio voice client for a guild and start its preset station playlist.
 
         Parameters
@@ -569,7 +641,7 @@ class RadioBot(discord.AutoShardedClient):
         await vc.play(vc.queue.get())
 
     @tasks.loop(seconds=10.0)
-    async def radio_loop(self: Self) -> None:
+    async def radio_loop(self) -> None:
         """The main loop for the radios.
 
         It (re)connects voice clients to voice channels and plays preset stations.
@@ -591,11 +663,11 @@ class RadioBot(discord.AutoShardedClient):
             self.loop.create_task(self.start_guild_radio(radio))
 
     @radio_loop.before_loop
-    async def radio_loop_before(self: Self) -> None:
+    async def radio_loop_before(self) -> None:
         await self.wait_until_ready()
 
     async def save_radio(
-        self: Self,
+        self,
         guild_id: int,
         channel_id: int,
         station_link: str,
@@ -639,7 +711,7 @@ class RadioBot(discord.AutoShardedClient):
 
         return record
 
-    async def delete_radio(self: Self, guild_id: int) -> None:
+    async def delete_radio(self, guild_id: int) -> None:
         """Delete a guild's radio.
 
         Parameters
