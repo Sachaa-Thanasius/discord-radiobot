@@ -142,17 +142,6 @@ def _add_radio(
         return GuildRadioInfo.from_row(rows[0]) if rows[0] else None
 
 
-class WavelinkSearchError(Exception):
-    """Exception raised when a wavelink search fails to find any tracks.
-
-    This inherits from :exc:`Exception`.
-    """
-
-    def __init__(self, *args: object) -> None:
-        self.message = "Failed to not find any songs matching that query."
-        super().__init__(*args)
-
-
 def resolve_path_with_links(path: Path, folder: bool = False) -> Path:
     """Resolve a path strictly with more secure default permissions, creating the path if necessary.
 
