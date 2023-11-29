@@ -457,7 +457,14 @@ class RadioPlayer(wavelink.Player):
 
 
 class VersionableTree(app_commands.CommandTree):
-    """A custom command tree to handle autosyncing and save command mentions."""
+    """A custom command tree to handle autosyncing and save command mentions.
+
+    Credit to LeoCx1000: The implemention for storing mentions of tree commands is his.
+    https://gist.github.com/LeoCx1000/021dc52981299b95ea7790416e4f5ca4
+
+    Credit to @mikeshardmind: The hashing methods in this class are his.
+    https://github.com/mikeshardmind/discord-rolebot/blob/ff0ca542ccc54a5527935839e511d75d3d178da0/rolebot/__main__.py#L486
+    """
 
     def __init__(self, client: RadioBot, *, fallback_to_global: bool = True) -> None:
         super().__init__(client, fallback_to_global=fallback_to_global)
@@ -485,9 +492,6 @@ class VersionableTree(app_commands.CommandTree):
     ) -> str | None:
         """Retrieves the mention of an AppCommand given a specific Command and optionally, a guild.
 
-        Credit to LeoCx1000: The implemention for storing mentions of tree commands is his.
-        https://gist.github.com/LeoCx1000/021dc52981299b95ea7790416e4f5ca4
-
         Parameters
         ----------
         command: :class:`app_commands.Command`
@@ -509,10 +513,7 @@ class VersionableTree(app_commands.CommandTree):
         return None
 
     async def get_hash(self) -> bytes:
-        """Generate a unique hash to represent all commands currently in the tree.
-
-        Credit to @mikeshardmind: The hashing methods in this class are his.
-        """
+        """Generate a unique hash to represent all commands currently in the tree."""
 
         commands = sorted(self._get_all_commands(guild=None), key=lambda c: c.qualified_name)
 
