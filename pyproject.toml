@@ -1,15 +1,14 @@
 [project]
 name = "discord-radiobot"
-version = "0.1.0"
-description = "A relatively minimal configuration Discord bot for setting up radios."
+description = "A small Discord bot for setting up radios."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "Sachaa-Thanasius", email = "111999343+Sachaa-Thanasius@users.noreply.github.com" }]
 
 [project.urls]
-Homepage = "https://github.com/Sachaa-Thanasius/discord-radiobot"
-"Bug Tracker" = "https://github.com/Sachaa-Thanasius/discord-radiobot/issues"
+Homepage = "https://github.com/SutaHelmIndustries/discord-radiobot"
+"Bug Tracker" = "https://github.com/SutaHelmIndustries/discord-radiobot/issues"
 
 [tool.ruff]
 # Credit to @mikeshardmind for most of this setup.

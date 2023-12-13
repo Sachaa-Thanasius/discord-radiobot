@@ -566,7 +566,7 @@ class RadioBot(discord.AutoShardedClient):
         self.config = config
         super().__init__(
             intents=discord.Intents(guilds=True, voice_states=True, typing=True),
-            activity=discord.Game(name="https://github.com/Sachaa-Thanasius/discord-radiobot"),
+            activity=discord.Game(name="https://github.com/SutaHelmIndustries/discord-radiobot"),
         )
         self.tree = VersionableTree(self)
 
