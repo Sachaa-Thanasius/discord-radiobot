@@ -1,5 +1,6 @@
 [project]
 name = "discord-radiobot"
+version = "2023.12.14"
 description = "A small Discord bot for setting up radios."
 readme = "README.md"
 license = "MIT"
