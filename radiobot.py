@@ -486,31 +486,61 @@ class VersionableTree(app_commands.CommandTree):
 
     async def find_mention_for(
         self,
-        command: app_commands.Command[Any, ..., Any],
+        command: app_commands.Command[Any, ..., Any] | app_commands.Group | str,
         *,
         guild: discord.abc.Snowflake | None = None,
     ) -> str | None:
-        """Retrieves the mention of an AppCommand given a specific Command and optionally, a guild.
+        """Retrieves the mention of an AppCommand given a specific command name, and optionally, a guild.
 
         Parameters
         ----------
-        command: :class:`app_commands.Command`
-            The command which it's mention we will attempt to retrieve.
-        guild: :class:`discord.abc.Snowflake` | None
-            The scope (guild) from which to retrieve the commands from.
-            If None is given or not passed, the global scope will be used.
+        name: app_commands.Command | app_commands.Group | str
+            The command which we will attempt to retrieve the mention of.
+        guild: discord.abc.Snowflake | None, optional
+            The scope (guild) from which to retrieve the commands from. If None is given or not passed,
+            the global scope will be used, however, if guild is passed and tree.fallback_to_global is
+            set to True (default), then the global scope will also be searched.
         """
 
-        try:
-            found_commands = self.application_commands[guild.id if guild else None]
-        except KeyError:
-            found_commands = await self.fetch_commands(guild=guild)
+        check_global = self.fallback_to_global is True and guild is not None
 
-        root_parent = command.root_parent or command
-        command_found = discord.utils.get(found_commands, name=root_parent.name)
-        if command_found:
-            return f"</{command.qualified_name}:{command_found.id}>"
-        return None
+        if isinstance(command, str):
+            # Try and find a command by that name. discord.py does not return children from tree.get_command, but
+            # using walk_commands and utils.get is a simple way around that.
+            _command = discord.utils.get(self.walk_commands(guild=guild), qualified_name=command)
+
+            if check_global and not _command:
+                _command = discord.utils.get(self.walk_commands(), qualified_name=command)
+
+        else:
+            _command = command
+
+        if not _command:
+            return None
+
+        if guild:
+            try:
+                local_commands = self.application_commands[guild.id]
+            except KeyError:
+                local_commands = await self.fetch_commands(guild=guild)
+
+            app_command_found = discord.utils.get(local_commands, name=(_command.root_parent or _command).name)
+
+        else:
+            app_command_found = None
+
+        if check_global and not app_command_found:
+            try:
+                global_commands = self.application_commands[None]
+            except KeyError:
+                global_commands = await self.fetch_commands()
+
+            app_command_found = discord.utils.get(global_commands, name=(_command.root_parent or _command).name)
+
+        if not app_command_found:
+            return None
+
+        return f"</{_command.qualified_name}:{app_command_found.id}>"
 
     async def get_hash(self) -> bytes:
         """Generate a unique hash to represent all commands currently in the tree."""
