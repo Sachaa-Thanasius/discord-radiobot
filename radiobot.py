@@ -350,16 +350,6 @@ async def volume(itx: discord.Interaction[RadioBot], volume: int | None = None) 
         await itx.response.send_message("No radio currently active in this server.")
 
 
-@app_commands.command()
-@app_commands.guild_only()
-async def invite(itx: discord.Interaction[RadioBot]) -> None:
-    """Get a link to invite this bot to a server."""
-
-    embed = discord.Embed(description="Click the link below to invite me to one of your servers.")
-    view = discord.ui.View().add_item(discord.ui.Button(label="Invite", url=itx.client.invite_link))
-    await itx.response.send_message(embed=embed, view=view, ephemeral=True)
-
-
 @app_commands.command(name="help")
 async def _help(itx: discord.Interaction[RadioBot], ephemeral: bool = True) -> None:
     """See a brief overview of all the bot's available commands and basic instructions for setting it up.
@@ -404,7 +394,7 @@ async def _help(itx: discord.Interaction[RadioBot], ephemeral: bool = True) -> N
     await itx.response.send_message(embed=help_embed, ephemeral=ephemeral)
 
 
-APP_COMMANDS = [radio_set, radio_get, radio_delete, radio_restart, radio_next, current, volume, _help, invite]
+APP_COMMANDS = [radio_set, radio_get, radio_delete, radio_restart, radio_next, current, volume, _help]
 
 
 class RadioPlayer(wavelink.Player):
