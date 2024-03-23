@@ -492,7 +492,7 @@ class VersionableTree(app_commands.CommandTree):
             set to True (default), then the global scope will also be searched.
         """
 
-        check_global = self.fallback_to_global is True and guild is not None
+        check_global = (self.fallback_to_global is True) or (guild is not None)
 
         if isinstance(command, str):
             # Try and find a command by that name. discord.py does not return children from tree.get_command, but
