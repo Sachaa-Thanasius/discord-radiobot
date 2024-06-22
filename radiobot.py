@@ -394,7 +394,16 @@ async def _help(itx: discord.Interaction[RadioBot], ephemeral: bool = True) -> N
     await itx.response.send_message(embed=help_embed, ephemeral=ephemeral)
 
 
-APP_COMMANDS = [radio_set, radio_get, radio_delete, radio_restart, radio_next, current, volume, _help]  # pyright: ignore [reportUnknownVariableType]
+APP_COMMANDS: list[app_commands.Command[Any, ..., None] | app_commands.Group] = [
+    radio_set,
+    radio_get,
+    radio_delete,
+    radio_restart,
+    radio_next,
+    current,
+    volume,
+    _help,
+]
 
 
 class RadioPlayer(wavelink.Player):
@@ -616,8 +625,8 @@ class RadioBot(discord.AutoShardedClient):
         self.radio_loop.start()
 
         # Add the app commands to the tree.
-        for cmd in APP_COMMANDS:  # pyright: ignore [reportUnknownVariableType]
-            self.tree.add_command(cmd)  # pyright: ignore [reportUnknownArgumentType]
+        for cmd in APP_COMMANDS:
+            self.tree.add_command(cmd)
 
         # Sync the tree if it's different from the previous version, using hashing for comparison.
         await self.tree.sync_if_commands_updated()
