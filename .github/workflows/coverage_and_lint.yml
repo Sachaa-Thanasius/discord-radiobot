@@ -29,9 +29,9 @@ jobs:
       - name: "Install Python deps @ ${{ matrix.python-version }}"
         id: install-deps
         run: |
-          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -U pip
           python -m pip install -U -r requirements.txt
-    
+
       - name: Setup node.js
         uses: actions/setup-node@v3
         with:

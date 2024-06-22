@@ -234,7 +234,7 @@ async def radio_get(itx: discord.Interaction[RadioBot]) -> None:
 
     assert itx.guild_id  # Known at runtime.
 
-    local_radio_results = await asyncio.to_thread(_query, itx.client.db_connection, [(itx.guild_id,)])
+    local_radio_results = _query(itx.client.db_connection, [(itx.guild_id,)])
 
     if local_radio_results and (local_radio := local_radio_results[0]):
         await itx.response.send_message(embed=local_radio.display_embed())
@@ -265,7 +265,7 @@ async def radio_restart(itx: discord.Interaction[RadioBot]) -> None:
     if vc := itx.guild.voice_client:
         await vc.disconnect(force=True)
 
-    guild_radio_records = await asyncio.to_thread(_query, itx.client.db_connection, [(itx.guild.id,)])
+    guild_radio_records = _query(itx.client.db_connection, [(itx.guild.id,)])
 
     if guild_radio_records:
         await itx.response.send_message("Restarting radio now. Give it a few seconds to rejoin.")
@@ -394,7 +394,7 @@ async def _help(itx: discord.Interaction[RadioBot], ephemeral: bool = True) -> N
     await itx.response.send_message(embed=help_embed, ephemeral=ephemeral)
 
 
-APP_COMMANDS = [radio_set, radio_get, radio_delete, radio_restart, radio_next, current, volume, _help]
+APP_COMMANDS = [radio_set, radio_get, radio_delete, radio_restart, radio_next, current, volume, _help]  # pyright: ignore [reportUnknownVariableType]
 
 
 class RadioPlayer(wavelink.Player):
@@ -539,9 +539,9 @@ class VersionableTree(app_commands.CommandTree):
 
         translator = self.translator
         if translator:
-            payload = [await command.get_translated_payload(translator) for command in commands]
+            payload = [await command.get_translated_payload(self, translator) for command in commands]
         else:
-            payload = [command.to_dict() for command in commands]
+            payload = [command.to_dict(self) for command in commands]
 
         return xxhash.xxh3_64_digest(json.dumps(payload).encode("utf-8"), seed=1)
 
@@ -612,12 +612,12 @@ class RadioBot(discord.AutoShardedClient):
         await wavelink.Pool.connect(nodes=[node], client=self)
 
         # Initialize the database and start the loop.
-        self._radio_enabled_guilds: set[int] = await asyncio.to_thread(_setup_db, self.db_connection)
+        self._radio_enabled_guilds: set[int] = _setup_db(self.db_connection)
         self.radio_loop.start()
 
         # Add the app commands to the tree.
-        for cmd in APP_COMMANDS:
-            self.tree.add_command(cmd)
+        for cmd in APP_COMMANDS:  # pyright: ignore [reportUnknownVariableType]
+            self.tree.add_command(cmd)  # pyright: ignore [reportUnknownArgumentType]
 
         # Sync the tree if it's different from the previous version, using hashing for comparison.
         await self.tree.sync_if_commands_updated()
@@ -663,11 +663,7 @@ class RadioBot(discord.AutoShardedClient):
             if (guild := self.get_guild(guild_id)) and not guild.voice_client
         ]
 
-        radio_results = await asyncio.to_thread(
-            _query,
-            self.db_connection,
-            [(guild_id,) for guild_id in inactive_radio_guild_ids],
-        )
+        radio_results = _query(self.db_connection, [(guild_id,) for guild_id in inactive_radio_guild_ids])
 
         for radio in radio_results:
             self.loop.create_task(self.start_guild_radio(radio))
@@ -703,8 +699,7 @@ class RadioBot(discord.AutoShardedClient):
             failed.
         """
 
-        record = await asyncio.to_thread(
-            _add_radio,
+        record = _add_radio(
             self.db_connection,
             guild_id=guild_id,
             channel_id=channel_id,

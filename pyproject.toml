@@ -1,15 +1,17 @@
 [project]
 name = "discord-radiobot"
-version = "2024.02.06"
+version = "2024.06.22"
 description = "A small Discord bot for setting up radios."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
-authors = [{ name = "Sachaa-Thanasius", email = "111999343+Sachaa-Thanasius@users.noreply.github.com" }]
+authors = [
+    { name = "Sachaa-Thanasius", email = "111999343+Sachaa-Thanasius@users.noreply.github.com" },
+]
 
 [project.urls]
 Homepage = "https://github.com/SutaHelmIndustries/discord-radiobot"
-"Bug Tracker" = "https://github.com/SutaHelmIndustries/discord-radiobot/issues"
+Issues = "https://github.com/SutaHelmIndustries/discord-radiobot/issues"
 
 [tool.ruff]
 line-length = 120
@@ -37,35 +39,36 @@ select = [
     "PIE",
     "T20",
     "PYI",
+    "PT",
     "RSE",
     "RET",
     "SIM",
     "TID",
     "PTH",
     "ERA",
-    "PD",
     "PL",
     "TRY",
-    "NPY",
     "RUF",
 ]
-extend-ignore = [
-    "G002",    # Erroneous issue with %-logging when logging can be configured for % logging.
-    "S101",    # Use of assert here is a known quantity. Blame typing memes.
+ignore = [
+    "S101",    # Allow use of assert for typing reasons.
     "PLR2004", # Magic value comparison.
-    "SIM105",  # Suppressable exception. I'm not paying the overhead of contextlib.suppress for stylistic choices.
-    "C90",     # McCabe complexity memes.
-    "ANN101",  # Type of self is implied.
-    "ANN401",  # Need Any for args and kwargs.
-    "PLR",     # Complexity things.
-    # Recommended by ruff when using ruff format.
+    "SIM105",  # Suppressable exception. contextlib.suppress is a stylistic choice with overhead.
+    "ANN101",  # Type of Self for self is usually implicit.
+    "ANN102",  # Type of type[Self] for cls is usually implicit.
+    "ANN204",  # Special method return types are usually implicit or known by type checkers.
+    "ANN401",  # Any is necessary sometimes.
+    "PT001",   # pytest recommends against empty parentheses on pytest.fixture.
+    "UP038",   # isinstance performs better with tuples than unions.
+    # == Recommended ignores by ruff when using ruff format.
     "E111",
     "E114",
     "E117",
-    "Q003",
+    "D206",
+    "D300",
     "COM812",
     "COM819",
-    "E501",
+    # "E501",
     "ISC001",
     "ISC002",
 ]
